@@ -48,8 +48,11 @@ pub struct DraftCard {
     pub body: String,
 }
 
-/// Temporary in-memory drafts used to build the workspace before SQLite is wired up.
-pub fn sample_drafts() -> Vec<DraftCard> {
+/// In-memory drafts for the explicit `--demo` mode only.
+///
+/// The persistence path must never call this. Real user data starts from an
+/// empty workspace and is loaded from local storage instead.
+pub(crate) fn sample_drafts() -> Vec<DraftCard> {
     vec![
         draft(
             1,

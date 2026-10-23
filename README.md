@@ -23,11 +23,16 @@ rough thoughts into editable message drafts.
 ## Development
 
 ```bash
-cargo run
+cargo run            # empty workspace
+cargo run -- --demo  # in-memory sample drafts for UI work
 cargo fmt --all -- --check
 cargo check
 cargo test
 ```
+
+`--demo` loads a small set of clearly labeled sample drafts. They live only
+in memory, are never written to local storage, and reset when the app exits.
+The normal launch path starts empty and is reserved for real persisted data.
 
 ## License
 

@@ -8,6 +8,7 @@ pub enum Screen {
     #[default]
     Home,
     Compose,
+    Review,
     Settings,
 }
 
@@ -52,6 +53,7 @@ pub enum Popup {
     Help,
     ConfirmQuit,
     SelectTone,
+    DiscardDump,
 }
 
 impl Popup {
@@ -60,10 +62,11 @@ impl Popup {
             Self::Help => "Help",
             Self::ConfirmQuit => "Quit blurp?",
             Self::SelectTone => "Select tone",
+            Self::DiscardDump => "Discard dump?",
         }
     }
 
-    pub const fn body(self) -> &'static str {
+    pub const fn body(self, sample_data: bool) -> &'static str {
         match self {
             Self::Help => {
                 "n                 new brain dump\n\
@@ -76,13 +79,23 @@ impl Popup {
                  q                 quit"
             }
             Self::ConfirmQuit => {
-                "Sample drafts reset on the next launch.\n\
-                 Anything half-typed is left behind.\n\n\
-                 Enter or y to quit. Esc or n to keep going."
+                if sample_data {
+                    "Sample drafts reset on the next launch.\n\
+                     Anything half-typed is left behind.\n\n\
+                     Enter or y to quit. Esc or n to keep going."
+                } else {
+                    "Nothing is saved between launches yet.\n\
+                     Anything half-typed is left behind.\n\n\
+                     Enter or y to quit. Esc or n to keep going."
+                }
             }
             Self::SelectTone => {
                 "Per-draft tone changes arrive with regeneration.\n\n\
                  Esc to close."
+            }
+            Self::DiscardDump => {
+                "This clears the text in the composer.\n\n\
+                 Enter or y to discard. Esc or n to keep it."
             }
         }
     }
@@ -158,12 +171,15 @@ pub struct UiState {
     pub sections: ListState,
     pub drafts: Vec<DraftCard>,
     pub draft_list: ListState,
+    pub sample_data: bool,
 
     pub composer: TextArea<'static>,
     pub quick_note: TextArea<'static>,
+    pub review_scroll: u16,
 
     pub generation: GenerationState,
     pub error: Option<String>,
+    pub notice: Option<String>,
 }
 
 impl Default for UiState {
@@ -177,12 +193,32 @@ impl Default for UiState {
             popup: None,
             section: Section::Inbox,
             sections,
-            drafts: sample_drafts(),
+            drafts: Vec::new(),
             draft_list: ListState::default(),
+            sample_data: false,
             composer: composer_editor(),
             quick_note: quick_note_editor(),
+            review_scroll: 0,
             generation: GenerationState::Idle,
             error: None,
+            notice: None,
+        };
+        state.sync_draft_selection();
+
+        state
+    }
+}
+
+impl UiState {
+    /// Development/demo state with clearly labeled in-memory sample drafts.
+    ///
+    /// This is only used by the explicit `--demo` entry point. Never use it
+    /// when loading or saving real user data.
+    pub fn demo() -> Self {
+        let mut state = Self {
+            drafts: sample_drafts(),
+            sample_data: true,
+            ..Self::default()
         };
         state.sync_draft_selection();
 
@@ -193,7 +229,7 @@ impl Default for UiState {
 fn composer_editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_placeholder_text(
-        "Dump it all here.\n\nTell Anya I can't make it tonight, ask Dev about the invoice...",
+        "Dump it all here.\n\nTell Anya I can't make it tonight, ask Dev about the invoice...\n\nCtrl+S to review when you're done.",
     );
     editor.set_placeholder_style(Style::default().fg(Color::DarkGray));
     editor
@@ -347,12 +383,90 @@ impl UiState {
 
     pub fn start_compose(&mut self) {
         self.popup = None;
+        self.error = None;
+        self.notice = None;
+        self.review_scroll = 0;
         self.screen = Screen::Compose;
     }
 
     pub fn leave_compose(&mut self) {
+        self.popup = None;
+        self.review_scroll = 0;
         self.screen = Screen::Home;
         self.focus = Focus::DraftList;
+    }
+
+    pub fn start_review(&mut self) -> bool {
+        if self.composer_text().trim().is_empty() {
+            self.screen = Screen::Compose;
+            self.set_error("Add a thought before reviewing.");
+            return false;
+        }
+
+        self.popup = None;
+        self.error = None;
+        self.notice = None;
+        self.review_scroll = 0;
+        self.screen = Screen::Review;
+
+        true
+    }
+
+    pub fn leave_review(&mut self) {
+        self.popup = None;
+        self.screen = Screen::Compose;
+    }
+
+    pub fn submit_compose(&mut self) -> bool {
+        if self.composer_text().trim().is_empty() {
+            self.set_error("Add a thought before submitting.");
+            return false;
+        }
+
+        self.popup = None;
+        self.error = None;
+        self.review_scroll = 0;
+        self.notice = Some("Dump ready · local drafting not connected".to_string());
+        self.screen = Screen::Home;
+        self.focus = Focus::DraftList;
+
+        true
+    }
+
+    pub fn discard_compose(&mut self) {
+        self.clear_composer();
+        self.popup = None;
+        self.error = None;
+        self.review_scroll = 0;
+        self.notice = Some("Dump discarded".to_string());
+        self.screen = Screen::Home;
+        self.focus = Focus::DraftList;
+    }
+
+    pub fn scroll_review(&mut self, delta: isize) {
+        let max = self.review_line_count().saturating_sub(1);
+        let max = max.min(u16::MAX as usize) as u16;
+        let amount = delta.unsigned_abs().min(u16::MAX as usize) as u16;
+
+        if delta < 0 {
+            self.review_scroll = self.review_scroll.saturating_sub(amount);
+        } else {
+            self.review_scroll = self.review_scroll.saturating_add(amount);
+        }
+        self.review_scroll = self.review_scroll.min(max);
+    }
+
+    pub fn review_to_start(&mut self) {
+        self.review_scroll = 0;
+    }
+
+    pub fn review_to_end(&mut self) {
+        let last_line = self.review_line_count().saturating_sub(1);
+        self.review_scroll = last_line.min(u16::MAX as usize) as u16;
+    }
+
+    pub fn review_line_count(&self) -> usize {
+        self.composer_text().lines().count().max(1)
     }
 
     pub fn clear_composer(&mut self) {
@@ -375,6 +489,7 @@ impl UiState {
     pub fn begin_generation(&mut self) {
         self.generation = GenerationState::Generating;
         self.error = None;
+        self.notice = None;
     }
 
     pub fn finish_generation(&mut self) {
@@ -385,10 +500,12 @@ impl UiState {
     pub fn fail_generation(&mut self, message: impl Into<String>) {
         self.generation = GenerationState::Idle;
         self.error = Some(message.into());
+        self.notice = None;
     }
 
     pub fn set_error(&mut self, message: impl Into<String>) {
         self.error = Some(message.into());
+        self.notice = None;
     }
 
     pub fn clear_error(&mut self) {
@@ -417,22 +534,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_state_starts_on_the_workspace() {
+    fn default_state_starts_with_an_empty_workspace() {
         let state = UiState::default();
 
         assert_eq!(state.screen, Screen::Home);
         assert_eq!(state.focus, Focus::DraftList);
         assert_eq!(state.section, Section::Inbox);
         assert_eq!(state.sections.selected(), Some(Section::Inbox.index()));
+        assert!(state.drafts.is_empty());
+        assert!(!state.sample_data);
+        assert_eq!(state.draft_list.selected(), None);
+        assert_eq!(state.selected_draft(), None);
+        assert_eq!(state.popup, None);
+        assert_eq!(state.generation, GenerationState::Idle);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn demo_state_starts_with_sample_drafts() {
+        let state = UiState::demo();
+
+        assert!(state.sample_data);
         assert_eq!(state.drafts.len(), 7);
         assert_eq!(state.draft_list.selected(), Some(0));
         assert_eq!(
             state.selected_draft().map(|draft| draft.title.as_str()),
             Some("Running late tonight")
         );
-        assert_eq!(state.popup, None);
-        assert_eq!(state.generation, GenerationState::Idle);
-        assert!(state.error.is_none());
     }
 
     #[test]
@@ -450,7 +578,7 @@ mod tests {
 
     #[test]
     fn changing_focus_preserves_unrelated_state() {
-        let mut state = UiState::default();
+        let mut state = UiState::demo();
         state.draft_list.select(Some(2));
         *state.draft_list.offset_mut() = 1;
         state.composer.insert_str("keep this dump");
@@ -473,7 +601,7 @@ mod tests {
         let mut state = UiState {
             section: Section::Drafts,
             focus: Focus::Preview,
-            ..UiState::default()
+            ..UiState::demo()
         };
         state.sections.select(Some(Section::Drafts.index()));
         state.draft_list.select(Some(1));
@@ -497,7 +625,7 @@ mod tests {
 
     #[test]
     fn sidebar_navigation_wraps_and_tracks_selection() {
-        let mut state = UiState::default();
+        let mut state = UiState::demo();
 
         state.select_next_section();
         assert_eq!(state.section, Section::Drafts);
@@ -520,7 +648,7 @@ mod tests {
 
     #[test]
     fn sections_filter_drafts_and_reset_selection() {
-        let mut state = UiState::default();
+        let mut state = UiState::demo();
 
         assert_eq!(state.visible_draft_count(), 3);
         assert_eq!(state.selected_draft().unwrap().status, DraftStatus::Review);
@@ -544,7 +672,7 @@ mod tests {
 
     #[test]
     fn first_and_last_section_shortcuts_jump_to_edges() {
-        let mut state = UiState::default();
+        let mut state = UiState::demo();
 
         state.select_last_section();
         assert_eq!(state.section, Section::Settings);
@@ -559,7 +687,7 @@ mod tests {
 
     #[test]
     fn first_and_last_draft_shortcuts_respect_the_section() {
-        let mut state = UiState::default();
+        let mut state = UiState::demo();
 
         state.select_last_draft();
         assert_eq!(state.draft_list.selected(), Some(2));
@@ -578,7 +706,7 @@ mod tests {
 
     #[test]
     fn draft_navigation_wraps_and_handles_an_empty_list() {
-        let mut state = UiState::default();
+        let mut state = UiState::demo();
 
         state.select_next_draft(0);
         assert_eq!(state.draft_list.selected(), None);
@@ -622,6 +750,99 @@ mod tests {
 
         state.clear_composer();
         assert_eq!(state.composer_text(), "");
+    }
+
+    #[test]
+    fn compose_flows_through_review_and_submit_without_losing_text() {
+        let mut state = UiState::default();
+
+        state.start_compose();
+        state.composer.insert_str(
+            "Tell Anya I can't make it tonight.\nAsk Dev whether the invoice was paid.",
+        );
+
+        assert!(state.start_review());
+        assert_eq!(state.screen, Screen::Review);
+        assert_eq!(state.review_scroll, 0);
+
+        state.scroll_review(1);
+        assert_eq!(state.review_scroll, 1);
+        state.review_to_start();
+        assert_eq!(state.review_scroll, 0);
+        state.review_to_end();
+        assert_eq!(state.review_scroll, 1);
+
+        state.leave_review();
+        assert_eq!(state.screen, Screen::Compose);
+        assert!(state.composer_text().contains("Ask Dev"));
+
+        assert!(state.start_review());
+        assert!(state.submit_compose());
+        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(state.focus, Focus::DraftList);
+        assert!(state.composer_text().contains("Ask Dev"));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Dump ready · local drafting not connected")
+        );
+    }
+
+    #[test]
+    fn empty_dumps_cannot_be_reviewed_or_submitted() {
+        let mut state = UiState::default();
+        state.start_compose();
+
+        assert!(!state.start_review());
+        assert_eq!(state.screen, Screen::Compose);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Add a thought before reviewing.")
+        );
+
+        state.composer.insert_str("   \n  ");
+        assert!(!state.start_review());
+        assert_eq!(state.screen, Screen::Compose);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Add a thought before reviewing.")
+        );
+
+        state.screen = Screen::Review;
+        assert!(!state.submit_compose());
+        assert_eq!(state.screen, Screen::Review);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Add a thought before submitting.")
+        );
+        assert_eq!(state.composer_text().trim(), "");
+    }
+
+    #[test]
+    fn discarding_a_dump_clears_the_composer_and_returns_home() {
+        let mut state = UiState::default();
+        state.start_compose();
+        state.composer.insert_str("A thought to discard.");
+
+        state.discard_compose();
+
+        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(state.focus, Focus::DraftList);
+        assert_eq!(state.composer_text(), "");
+        assert_eq!(state.notice.as_deref(), Some("Dump discarded"));
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn starting_a_compose_clears_stale_notices_and_errors() {
+        let mut state = UiState::default();
+        state.set_error("previous failure");
+        state.notice = Some("previous notice".to_string());
+
+        state.start_compose();
+
+        assert_eq!(state.screen, Screen::Compose);
+        assert!(state.error.is_none());
+        assert!(state.notice.is_none());
     }
 
     #[test]
