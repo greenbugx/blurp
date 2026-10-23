@@ -1,18 +1,29 @@
 use crate::app::App;
+use crate::draft::{DraftCard, DraftStatus};
 use crate::state::{Focus, Popup, Screen, Section, UiState};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, StatefulWidget, Widget, Wrap},
+    widgets::{
+        Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, StatefulWidget,
+        Widget, Wrap,
+    },
 };
 
+const BG: Color = Color::Rgb(11, 16, 15);
+const TEXT: Color = Color::Rgb(216, 224, 221);
 const ACCENT: Color = Color::Rgb(126, 231, 197);
-const BORDER: Color = Color::Rgb(70, 84, 82);
-const MUTED: Color = Color::Rgb(138, 150, 147);
+const BORDER: Color = Color::Rgb(64, 78, 75);
+const MUTED: Color = Color::Rgb(132, 146, 142);
 const ERROR: Color = Color::Rgb(255, 128, 128);
-const SELECTED: Color = Color::Rgb(180, 255, 232);
+const SELECTED_BG: Color = Color::Rgb(27, 46, 41);
+const SELECTED_BG_DIM: Color = Color::Rgb(22, 32, 30);
+const REVIEW: Color = Color::Rgb(232, 190, 122);
+const DRAFT: Color = Color::Rgb(180, 220, 205);
+const SNOOZED: Color = Color::Rgb(150, 176, 214);
+const DONE: Color = Color::Rgb(120, 160, 148);
 
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 18;
@@ -24,6 +35,8 @@ impl Widget for &mut App {
 }
 
 fn render_ui(state: &mut UiState, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, base_style());
+
     match state.screen {
         Screen::Home => render_home(state, area, buf),
         Screen::Compose => render_compose(state, area, buf),
@@ -46,8 +59,8 @@ fn render_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
         Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(main);
     let [sidebar, drafts, preview] = Layout::horizontal([
         Constraint::Length(20),
-        Constraint::Min(24),
-        Constraint::Min(28),
+        Constraint::Fill(1),
+        Constraint::Fill(1),
     ])
     .areas(workspace);
 
@@ -59,34 +72,70 @@ fn render_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_sidebar(state: &mut UiState, area: Rect, buf: &mut Buffer) {
+    let focused = state.focus == Focus::Sidebar;
+    let content_width = area.width.saturating_sub(5) as usize;
+
     let items = Section::ALL
         .iter()
-        .map(|section| ListItem::new(format!(" {} ", section.label())))
+        .map(|section| {
+            let count = state.section_draft_count(*section);
+            let count = if count > 0 {
+                count.to_string()
+            } else {
+                String::new()
+            };
+            let gap = content_width.saturating_sub(section.label().len() + count.len());
+
+            ListItem::new(Line::from(vec![
+                Span::styled(section.label(), Style::default().fg(TEXT)),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(count, Style::default().fg(MUTED)),
+            ]))
+        })
         .collect::<Vec<_>>();
 
     let list = List::new(items)
-        .block(pane_block("Sections", state.focus == Focus::Sidebar))
-        .highlight_style(highlight_style(state.focus == Focus::Sidebar))
-        .highlight_symbol("› ");
+        .block(pane_block("blurp", focused))
+        .highlight_symbol(highlight_symbol(focused))
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(highlight_style(focused));
 
     StatefulWidget::render(list, area, buf, &mut state.sections);
 }
 
-fn render_draft_list(state: &UiState, area: Rect, buf: &mut Buffer) {
-    let block = pane_block(state.section.label(), state.focus == Focus::DraftList);
+fn render_draft_list(state: &mut UiState, area: Rect, buf: &mut Buffer) {
+    let focused = state.focus == Focus::DraftList;
+    let count = state.visible_draft_count();
+    let title = if count > 0 {
+        format!("{} · {count}", state.section.label())
+    } else {
+        state.section.label().to_string()
+    };
+    let block = pane_block(title, focused);
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let empty = match state.section {
-        Section::Settings => "Press Enter to open settings.",
-        _ => "Press n to dump a thought.\n\nDrafts will appear here after you process one.",
-    };
+    if count == 0 {
+        Paragraph::new(empty_list_message(state.section))
+            .style(Style::default().fg(MUTED))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
+        return;
+    }
 
-    Paragraph::new(format!("Nothing here yet.\n\n{empty}"))
-        .style(Style::default().fg(MUTED))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true })
-        .render(inner, buf);
+    let content_width = inner.width.saturating_sub(3) as usize;
+    let items = state
+        .visible_drafts()
+        .map(|draft| draft_item(draft, content_width))
+        .collect::<Vec<_>>();
+
+    let list = List::new(items)
+        .highlight_symbol(highlight_symbol(focused))
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(highlight_style(focused));
+
+    StatefulWidget::render(list, inner, buf, &mut state.draft_list);
 }
 
 fn render_preview(state: &UiState, area: Rect, buf: &mut Buffer) {
@@ -94,18 +143,33 @@ fn render_preview(state: &UiState, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let body = match state.drafts.selected() {
-        Some(index) => format!(
-            "Draft #{}\n\nMessage details will render here once drafts are persisted.",
-            index + 1
-        ),
-        None => "No draft selected.\n\nSelect a draft to read its message body here.".to_string(),
+    let Some(draft) = state.selected_draft() else {
+        Paragraph::new("No draft selected.\n\nChoose a draft to read its message body here.")
+            .style(Style::default().fg(MUTED))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
+        return;
     };
 
-    Paragraph::new(body)
-        .style(Style::default().fg(MUTED))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true })
+    let mut lines = vec![
+        Line::from(Span::styled(
+            draft.title.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(draft_meta(draft)),
+        Line::from(""),
+    ];
+
+    for body_line in draft.body.lines() {
+        lines.push(Line::from(Span::styled(
+            body_line.to_string(),
+            Style::default().fg(TEXT),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
         .render(inner, buf);
 }
 
@@ -145,8 +209,7 @@ fn render_settings(state: &UiState, area: Rect, buf: &mut Buffer) {
     block.render(body, buf);
 
     Paragraph::new(
-        "Settings\n\n\
-         Model selection, storage location, and other preferences will live here.\n\n\
+        "Model selection, storage location, and other preferences will live here.\n\n\
          Nothing is sent to a cloud service. Press Esc to return to the workspace.",
     )
     .style(Style::default().fg(MUTED))
@@ -158,32 +221,60 @@ fn render_settings(state: &UiState, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_footer(state: &UiState, area: Rect, buf: &mut Buffer) {
-    let lines = vec![
-        Line::from(Span::styled(
-            footer_shortcuts(state),
-            Style::default().fg(MUTED),
-        )),
-        footer_status(state),
-    ];
+    let [shortcuts, status] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
-    Paragraph::new(lines).render(area, buf);
+    Paragraph::new(shortcut_line(state)).render(shortcuts, buf);
+    Paragraph::new(footer_status(state)).render(status, buf);
 }
 
-fn footer_shortcuts(state: &UiState) -> &'static str {
-    if state.popup.is_some() {
-        return " Esc close popup · Enter confirms where shown";
+fn shortcut_line(state: &UiState) -> Line<'static> {
+    let pairs: &[(&str, &str)] = if state.popup.is_some() {
+        &[("Esc", "close"), ("Enter", "confirm where shown")]
+    } else {
+        match state.screen {
+            Screen::Compose => &[("type", "freely"), ("Esc", "back, text kept")],
+            Screen::Settings => &[("Esc", "back"), ("?", "help"), ("q", "quit")],
+            Screen::Home => match state.focus {
+                Focus::Sidebar => &[
+                    ("j/k", "section"),
+                    ("Enter", "open"),
+                    ("Tab", "pane"),
+                    ("n", "new"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ],
+                Focus::DraftList => &[
+                    ("j/k", "move"),
+                    ("Enter", "open"),
+                    ("Tab", "pane"),
+                    ("n", "new"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ],
+                Focus::Preview => &[
+                    ("Esc", "back"),
+                    ("Tab", "pane"),
+                    ("n", "new"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ],
+                Focus::QuickNote => &[("type", "note"), ("Esc", "done"), ("Tab", "pane")],
+            },
+        }
+    };
+
+    let mut spans = Vec::new();
+    for (index, (key, action)) in pairs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(BORDER)));
+        }
+        spans.push(Span::styled(*key, Style::default().fg(ACCENT)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*action, Style::default().fg(MUTED)));
     }
 
-    match state.screen {
-        Screen::Compose => " Type freely · Esc back (your text is kept)",
-        Screen::Settings => " Esc back",
-        Screen::Home => match state.focus {
-            Focus::Sidebar => " j/k move · Enter select · Tab pane · n new · ? help · q quit",
-            Focus::DraftList => " j/k move · Enter open · Tab pane · n new · ? help · q quit",
-            Focus::Preview => " Esc back · Tab pane · n new · ? help · q quit",
-            Focus::QuickNote => " Type a note · Esc done · Tab pane",
-        },
-    }
+    Line::from(spans)
 }
 
 fn footer_status(state: &UiState) -> Line<'static> {
@@ -196,40 +287,60 @@ fn footer_status(state: &UiState) -> Line<'static> {
 
     if state.generation.is_generating() {
         return Line::from(Span::styled(
-            " Generating locally with Ollama…",
+            " Generating locally with Ollama...",
             Style::default().fg(ACCENT),
         ));
     }
 
-    Line::from(Span::styled(
-        " local-only · no cloud · your words stay here",
-        Style::default().fg(MUTED),
-    ))
+    if state.screen == Screen::Compose {
+        return Line::from(Span::styled(
+            " local-only · your text stays in this session",
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(ACCENT)),
+        Span::styled(
+            "sample drafts in memory · nothing is saved yet",
+            Style::default().fg(MUTED),
+        ),
+    ])
 }
 
 fn render_popup(popup: Popup, area: Rect, buf: &mut Buffer) {
-    let popup_area = centered_rect(area, 66, 16);
+    let (max_width, max_height) = match popup {
+        Popup::Help => (58, 11),
+        Popup::ConfirmQuit => (58, 9),
+        Popup::SelectTone => (58, 7),
+    };
+    let popup_area = centered_rect(area, max_width, max_height);
     if popup_area.width < 20 || popup_area.height < 5 {
         return;
     }
 
     Clear.render(popup_area, buf);
+    buf.set_style(popup_area, base_style());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(format!(" {} ", popup.title()));
+        .title(Span::styled(
+            format!(" {} ", popup.title()),
+            Style::default().fg(ACCENT),
+        ));
     let inner = block.inner(popup_area);
     block.render(popup_area, buf);
 
     Paragraph::new(format!("\n{}\n", popup.body()))
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: false })
         .render(inner, buf);
 }
 
 fn render_too_small(area: Rect, buf: &mut Buffer) {
     Clear.render(area, buf);
+    buf.set_style(area, base_style());
 
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
@@ -251,22 +362,122 @@ fn render_too_small(area: Rect, buf: &mut Buffer) {
     .render(middle, buf);
 }
 
-fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
+fn draft_item(draft: &DraftCard, width: usize) -> ListItem<'static> {
+    let status = draft.status.label();
+    let title_width = width.saturating_sub(status.len() + 2).max(4);
+    let title = truncate_chars(&draft.title, title_width);
+    let gap = width
+        .saturating_sub(title.chars().count() + status.len())
+        .max(1);
+
+    let title_line = Line::from(vec![
+        Span::styled(
+            title,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            status.to_string(),
+            Style::default().fg(status_color(draft.status)),
+        ),
+    ]);
+
+    let meta = match &draft.recipient {
+        Some(recipient) => format!("To {recipient} · {}", draft.tone.label()),
+        None => draft.tone.label().to_string(),
+    };
+    let preview = preview_text(&draft.body, width);
+
+    ListItem::new(vec![
+        title_line,
+        Line::from(Span::styled(meta, Style::default().fg(MUTED))),
+        Line::from(Span::styled(preview, Style::default().fg(TEXT))),
+        Line::from(""),
+    ])
+}
+
+fn draft_meta(draft: &DraftCard) -> Vec<Span<'static>> {
+    let prefix = match &draft.recipient {
+        Some(recipient) => format!("To {recipient} · {} · ", draft.tone.label()),
+        None => format!("{} · ", draft.tone.label()),
+    };
+
+    vec![
+        Span::styled(prefix, Style::default().fg(MUTED)),
+        Span::styled(
+            draft.status.label(),
+            Style::default().fg(status_color(draft.status)),
+        ),
+    ]
+}
+
+fn empty_list_message(section: Section) -> &'static str {
+    match section {
+        Section::Inbox => "Nothing needs a look right now.\n\nPress n to dump a thought.",
+        Section::Drafts => "No drafts in progress.\n\nPress n to start from a brain dump.",
+        Section::Snoozed => "Nothing snoozed.\n\nDrafts you set aside wait here.",
+        Section::Completed => "Nothing completed yet.\n\nFinished drafts land here.",
+        Section::Settings => "Press Enter on Settings in the sidebar.",
+    }
+}
+
+fn preview_text(body: &str, width: usize) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&flat, width.max(4))
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+
+    let mut shortened = text.chars().take(max.saturating_sub(1)).collect::<String>();
+    if let Some(index) = shortened.rfind(' ') {
+        shortened.truncate(index);
+    }
+    shortened.push('…');
+    shortened
+}
+
+fn status_color(status: DraftStatus) -> Color {
+    match status {
+        DraftStatus::Review => REVIEW,
+        DraftStatus::Draft => DRAFT,
+        DraftStatus::Snoozed => SNOOZED,
+        DraftStatus::Completed => DONE,
+    }
+}
+
+fn pane_block(title: impl Into<String>, focused: bool) -> Block<'static> {
     let color = if focused { ACCENT } else { BORDER };
 
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(color))
         .title(Span::styled(
-            format!(" {title} "),
+            format!(" {} ", title.into()),
             Style::default().fg(color),
         ))
 }
 
-fn highlight_style(focused: bool) -> Style {
-    let color = if focused { SELECTED } else { Color::Gray };
+fn highlight_symbol(focused: bool) -> Line<'static> {
+    let color = if focused { ACCENT } else { MUTED };
 
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+    Line::from(Span::styled("▌ ", Style::default().fg(color)))
+}
+
+fn highlight_style(focused: bool) -> Style {
+    let background = if focused {
+        SELECTED_BG
+    } else {
+        SELECTED_BG_DIM
+    };
+
+    Style::default().bg(background).add_modifier(Modifier::BOLD)
+}
+
+fn base_style() -> Style {
+    Style::default().bg(BG).fg(TEXT)
 }
 
 fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
@@ -324,7 +535,7 @@ mod tests {
                 focus,
                 ..UiState::default()
             };
-            state.drafts.select(Some(1));
+            state.draft_list.select(Some(1));
             state.error = Some("a readable error".to_string());
             state.generation = crate::state::GenerationState::Generating;
 
@@ -332,5 +543,80 @@ mod tests {
             let mut buf = Buffer::empty(area);
             render_ui(&mut state, area, &mut buf);
         }
+    }
+
+    #[test]
+    fn workspace_shows_the_selected_draft_in_the_preview() {
+        let mut state = UiState::default();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+
+        render_ui(&mut state, area, &mut buf);
+        let text = buffer_text(&buf);
+
+        assert!(text.contains("blurp"));
+        assert!(text.contains("Inbox · 3"));
+        assert!(text.contains("Running late tonight"));
+        assert!(text.contains("can't make it tonight"));
+        assert!(text.contains("review"));
+        assert!(text.contains("sample drafts in memory"));
+    }
+
+    #[test]
+    fn empty_sections_render_a_calm_message() {
+        let mut state = UiState::default();
+        state
+            .drafts
+            .retain(|draft| draft.status != DraftStatus::Snoozed);
+        state.sections.select(Some(Section::Snoozed.index()));
+        state.section = Section::Snoozed;
+        state.sync_draft_selection();
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        render_ui(&mut state, area, &mut buf);
+
+        assert!(buffer_text(&buf).contains("Nothing snoozed"));
+        assert_eq!(state.draft_list.selected(), None);
+    }
+
+    #[test]
+    fn selected_row_highlight_covers_all_item_lines() {
+        let mut state = UiState::default();
+        state.draft_list.select(Some(1));
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_ui(&mut state, area, &mut buf);
+
+        let y = (0..area.height)
+            .find(|&y| {
+                (21..70)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Invoice follow-up")
+            })
+            .expect("selected title should render");
+
+        for offset in 0..4 {
+            assert_eq!(
+                buf[(30, y + offset)].bg,
+                SELECTED_BG,
+                "highlight should cover line {offset}"
+            );
+        }
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let mut text = String::new();
+
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        text
     }
 }

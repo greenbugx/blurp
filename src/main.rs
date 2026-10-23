@@ -1,6 +1,7 @@
 use crate::app::App;
 
 pub mod app;
+pub mod draft;
 pub mod event;
 pub mod state;
 pub mod ui;

@@ -1,3 +1,4 @@
+use crate::draft::{DraftCard, DraftStatus, sample_drafts};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{Input, TextArea};
@@ -74,8 +75,8 @@ impl Popup {
                  q                 quit"
             }
             Self::ConfirmQuit => {
-                "Your drafts are safe. Anything half-typed in this\n\
-                 session will be left behind.\n\n\
+                "Sample drafts reset on the next launch.\n\
+                 Anything half-typed is left behind.\n\n\
                  Enter or y to quit. Esc or n to keep going."
             }
             Self::SelectTone => {
@@ -134,6 +135,16 @@ impl Section {
             .position(|section| *section == self)
             .unwrap_or_default()
     }
+
+    pub const fn accepts(self, status: DraftStatus) -> bool {
+        matches!(
+            (self, status),
+            (Self::Inbox, DraftStatus::Review)
+                | (Self::Drafts, DraftStatus::Draft)
+                | (Self::Snoozed, DraftStatus::Snoozed)
+                | (Self::Completed, DraftStatus::Completed)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -144,7 +155,8 @@ pub struct UiState {
 
     pub section: Section,
     pub sections: ListState,
-    pub drafts: ListState,
+    pub drafts: Vec<DraftCard>,
+    pub draft_list: ListState,
 
     pub composer: TextArea<'static>,
     pub quick_note: TextArea<'static>,
@@ -158,18 +170,22 @@ impl Default for UiState {
         let mut sections = ListState::default();
         sections.select(Some(Section::Inbox.index()));
 
-        Self {
+        let mut state = Self {
             screen: Screen::Home,
             focus: Focus::DraftList,
             popup: None,
             section: Section::Inbox,
             sections,
-            drafts: ListState::default(),
+            drafts: sample_drafts(),
+            draft_list: ListState::default(),
             composer: composer_editor(),
             quick_note: quick_note_editor(),
             generation: GenerationState::Idle,
             error: None,
-        }
+        };
+        state.sync_draft_selection();
+
+        state
     }
 }
 
@@ -226,32 +242,78 @@ impl UiState {
 
         self.sections.select(Some(next));
         self.section = Section::ALL[next];
+        self.selector_changed();
+    }
+
+    fn selector_changed(&mut self) {
+        self.draft_list.select(Some(0));
+        *self.draft_list.offset_mut() = 0;
+        self.sync_draft_selection();
+    }
+
+    pub fn section_draft_count(&self, section: Section) -> usize {
+        self.drafts
+            .iter()
+            .filter(|draft| section.accepts(draft.status))
+            .count()
+    }
+
+    pub fn visible_drafts(&self) -> impl Iterator<Item = &DraftCard> {
+        self.drafts
+            .iter()
+            .filter(|draft| self.section.accepts(draft.status))
+    }
+
+    pub fn visible_draft_count(&self) -> usize {
+        self.visible_drafts().count()
+    }
+
+    pub fn draft_at(&self, index: usize) -> Option<&DraftCard> {
+        self.visible_drafts().nth(index)
+    }
+
+    pub fn selected_draft(&self) -> Option<&DraftCard> {
+        let index = self.draft_list.selected()?;
+        self.draft_at(index)
+    }
+
+    pub fn sync_draft_selection(&mut self) {
+        let count = self.visible_draft_count();
+        if count == 0 {
+            self.draft_list.select(None);
+        } else if self
+            .draft_list
+            .selected()
+            .is_none_or(|index| index >= count)
+        {
+            self.draft_list.select(Some(0));
+        }
     }
 
     pub fn select_next_draft(&mut self, count: usize) {
         if count == 0 {
-            self.drafts.select(None);
+            self.draft_list.select(None);
             return;
         }
 
-        let next = match self.drafts.selected() {
+        let next = match self.draft_list.selected() {
             Some(index) if index + 1 < count => index + 1,
             _ => 0,
         };
-        self.drafts.select(Some(next));
+        self.draft_list.select(Some(next));
     }
 
     pub fn select_previous_draft(&mut self, count: usize) {
         if count == 0 {
-            self.drafts.select(None);
+            self.draft_list.select(None);
             return;
         }
 
-        let next = match self.drafts.selected() {
+        let next = match self.draft_list.selected() {
             Some(index) if index > 0 && index < count => index - 1,
             _ => count - 1,
         };
-        self.drafts.select(Some(next));
+        self.draft_list.select(Some(next));
     }
 
     pub fn start_compose(&mut self) {
@@ -278,6 +340,7 @@ impl UiState {
         self.focus = Focus::Sidebar;
         self.sections.select(Some(Section::Settings.index()));
         self.section = Section::Settings;
+        self.selector_changed();
     }
 
     pub fn begin_generation(&mut self) {
@@ -332,7 +395,12 @@ mod tests {
         assert_eq!(state.focus, Focus::DraftList);
         assert_eq!(state.section, Section::Inbox);
         assert_eq!(state.sections.selected(), Some(Section::Inbox.index()));
-        assert_eq!(state.drafts.selected(), None);
+        assert_eq!(state.drafts.len(), 7);
+        assert_eq!(state.draft_list.selected(), Some(0));
+        assert_eq!(
+            state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Running late tonight")
+        );
         assert_eq!(state.popup, None);
         assert_eq!(state.generation, GenerationState::Idle);
         assert!(state.error.is_none());
@@ -354,8 +422,8 @@ mod tests {
     #[test]
     fn changing_focus_preserves_unrelated_state() {
         let mut state = UiState::default();
-        state.drafts.select(Some(2));
-        *state.drafts.offset_mut() = 1;
+        state.draft_list.select(Some(2));
+        *state.draft_list.offset_mut() = 1;
         state.composer.insert_str("keep this dump");
         state.quick_note.insert_str("keep this note");
         state.fail_generation("ollama is not running");
@@ -364,8 +432,8 @@ mod tests {
         state.focus_next();
         state.focus_previous();
 
-        assert_eq!(state.drafts.selected(), Some(2));
-        assert_eq!(state.drafts.offset(), 1);
+        assert_eq!(state.draft_list.selected(), Some(2));
+        assert_eq!(state.draft_list.offset(), 1);
         assert_eq!(state.composer_text(), "keep this dump");
         assert_eq!(state.quick_note_text(), "keep this note");
         assert_eq!(state.error.as_deref(), Some("ollama is not running"));
@@ -379,8 +447,8 @@ mod tests {
             ..UiState::default()
         };
         state.sections.select(Some(Section::Drafts.index()));
-        state.drafts.select(Some(3));
-        *state.drafts.offset_mut() = 2;
+        state.draft_list.select(Some(1));
+        *state.draft_list.offset_mut() = 1;
         state.composer.insert_str("unfinished thought");
 
         state.open_popup(Popup::Help);
@@ -392,8 +460,8 @@ mod tests {
         assert_eq!(state.focus, Focus::Preview);
         assert_eq!(state.section, Section::Drafts);
         assert_eq!(state.sections.selected(), Some(Section::Drafts.index()));
-        assert_eq!(state.drafts.selected(), Some(3));
-        assert_eq!(state.drafts.offset(), 2);
+        assert_eq!(state.draft_list.selected(), Some(1));
+        assert_eq!(state.draft_list.offset(), 1);
         assert_eq!(state.composer_text(), "unfinished thought");
         assert!(!state.close_popup(), "closing twice should be harmless");
     }
@@ -405,6 +473,7 @@ mod tests {
         state.select_next_section();
         assert_eq!(state.section, Section::Drafts);
         assert_eq!(state.sections.selected(), Some(1));
+        assert_eq!(state.draft_list.selected(), Some(0));
 
         state.select_previous_section();
         assert_eq!(state.section, Section::Inbox);
@@ -413,9 +482,35 @@ mod tests {
         state.select_previous_section();
         assert_eq!(state.section, Section::Settings);
         assert_eq!(state.sections.selected(), Some(4));
+        assert_eq!(state.draft_list.selected(), None);
 
         state.select_next_section();
         assert_eq!(state.section, Section::Inbox);
+        assert_eq!(state.draft_list.selected(), Some(0));
+    }
+
+    #[test]
+    fn sections_filter_drafts_and_reset_selection() {
+        let mut state = UiState::default();
+
+        assert_eq!(state.visible_draft_count(), 3);
+        assert_eq!(state.selected_draft().unwrap().status, DraftStatus::Review);
+
+        state.select_next_section();
+        assert_eq!(state.section, Section::Drafts);
+        assert_eq!(state.visible_draft_count(), 2);
+        assert_eq!(state.selected_draft().unwrap().status, DraftStatus::Draft);
+
+        state.select_next_draft(state.visible_draft_count());
+        assert_eq!(state.draft_list.selected(), Some(1));
+
+        state.select_previous_section();
+        assert_eq!(state.section, Section::Inbox);
+        assert_eq!(state.draft_list.selected(), Some(0));
+        assert_eq!(
+            state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Running late tonight")
+        );
     }
 
     #[test]
@@ -423,25 +518,25 @@ mod tests {
         let mut state = UiState::default();
 
         state.select_next_draft(0);
-        assert_eq!(state.drafts.selected(), None);
+        assert_eq!(state.draft_list.selected(), None);
 
         state.select_next_draft(3);
-        assert_eq!(state.drafts.selected(), Some(0));
+        assert_eq!(state.draft_list.selected(), Some(0));
 
         state.select_next_draft(3);
-        assert_eq!(state.drafts.selected(), Some(1));
+        assert_eq!(state.draft_list.selected(), Some(1));
 
         state.select_next_draft(3);
-        assert_eq!(state.drafts.selected(), Some(2));
+        assert_eq!(state.draft_list.selected(), Some(2));
 
         state.select_next_draft(3);
-        assert_eq!(state.drafts.selected(), Some(0));
+        assert_eq!(state.draft_list.selected(), Some(0));
 
         state.select_previous_draft(3);
-        assert_eq!(state.drafts.selected(), Some(2));
+        assert_eq!(state.draft_list.selected(), Some(2));
 
         state.select_next_draft(0);
-        assert_eq!(state.drafts.selected(), None);
+        assert_eq!(state.draft_list.selected(), None);
     }
 
     #[test]

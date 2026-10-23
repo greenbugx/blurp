@@ -157,9 +157,7 @@ impl App {
                 }
             }
             Focus::DraftList => {
-                // The draft collection arrives with persistence. Until then the list is empty,
-                // and these calls simply keep the selection unset.
-                let draft_count = 0;
+                let draft_count = self.state.visible_draft_count();
                 if direction > 0 {
                     self.state.select_next_draft(draft_count);
                 } else {
@@ -180,7 +178,7 @@ impl App {
                 }
             }
             Focus::DraftList => {
-                if self.state.drafts.selected().is_some() {
+                if self.state.selected_draft().is_some() {
                     self.state.focus = Focus::Preview;
                 }
             }
@@ -217,8 +215,8 @@ mod tests {
     async fn help_popup_opens_and_closes_without_losing_context() {
         let mut app = App::new();
         app.state.focus = Focus::Preview;
-        app.state.drafts.select(Some(2));
-        *app.state.drafts.offset_mut() = 1;
+        app.state.draft_list.select(Some(2));
+        *app.state.draft_list.offset_mut() = 1;
 
         app.handle_key_events(key(KeyCode::Char('?'))).unwrap();
         assert_eq!(app.state.popup, Some(Popup::Help));
@@ -227,8 +225,8 @@ mod tests {
         assert_eq!(app.state.popup, None);
         assert_eq!(app.state.screen, Screen::Home);
         assert_eq!(app.state.focus, Focus::Preview);
-        assert_eq!(app.state.drafts.selected(), Some(2));
-        assert_eq!(app.state.drafts.offset(), 1);
+        assert_eq!(app.state.draft_list.selected(), Some(2));
+        assert_eq!(app.state.draft_list.offset(), 1);
     }
 
     #[tokio::test]
@@ -242,6 +240,45 @@ mod tests {
         app.handle_key_events(key(KeyCode::Esc)).unwrap();
         assert_eq!(app.state.popup, None);
         assert!(app.running);
+    }
+
+    #[tokio::test]
+    async fn draft_selection_moves_and_opens_the_preview() {
+        let mut app = App::new();
+
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Running late tonight")
+        );
+
+        app.handle_key_events(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Invoice follow-up")
+        );
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.state.focus, Focus::Preview);
+
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.focus, Focus::DraftList);
+    }
+
+    #[tokio::test]
+    async fn section_selection_changes_the_visible_drafts() {
+        let mut app = App::new();
+        app.state.focus = Focus::Sidebar;
+
+        app.handle_key_events(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(app.state.section, Section::Drafts);
+        assert_eq!(app.state.visible_draft_count(), 2);
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Conference follow-up")
+        );
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.state.focus, Focus::DraftList);
     }
 
     #[tokio::test]
