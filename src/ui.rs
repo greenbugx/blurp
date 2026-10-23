@@ -336,8 +336,12 @@ fn shortcut_line(state: &UiState, width: u16) -> Line<'static> {
 }
 
 fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
-    if state.popup.is_some() {
-        return &[("Esc", "close"), ("Enter", "confirm where shown")];
+    if let Some(popup) = state.popup {
+        return match popup {
+            Popup::Help => &[("Esc", "close"), ("q", "quit")],
+            Popup::ConfirmQuit => &[("Enter", "quit"), ("Esc", "cancel")],
+            Popup::SelectTone => &[("Esc", "close")],
+        };
     }
 
     match state.screen {
@@ -373,8 +377,12 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
 }
 
 fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
-    if state.popup.is_some() {
-        return &[("Esc", "close")];
+    if let Some(popup) = state.popup {
+        return match popup {
+            Popup::Help => &[("Esc", "close"), ("q", "quit")],
+            Popup::ConfirmQuit => &[("Enter", "quit"), ("Esc", "cancel")],
+            Popup::SelectTone => &[("Esc", "close")],
+        };
     }
 
     match state.screen {
@@ -442,7 +450,7 @@ fn footer_status(state: &UiState, width: u16) -> Line<'static> {
 
 fn render_popup(popup: Popup, area: Rect, buf: &mut Buffer) {
     let (max_width, max_height) = match popup {
-        Popup::Help => (58, 11),
+        Popup::Help => (58, 12),
         Popup::ConfirmQuit => (58, 9),
         Popup::SelectTone => (58, 7),
     };
@@ -822,29 +830,59 @@ mod tests {
     fn footer_shortcuts_fit_the_available_width() {
         for width in [48, 56, 70, 72, 80, 120] {
             for focus in Focus::ALL {
-                let state = UiState {
-                    focus,
-                    ..UiState::default()
-                };
-                let line = shortcut_line(&state, width);
-                let status = footer_status(&state, width);
+                for popup in [
+                    None,
+                    Some(Popup::Help),
+                    Some(Popup::ConfirmQuit),
+                    Some(Popup::SelectTone),
+                ] {
+                    let state = UiState {
+                        focus,
+                        popup,
+                        ..UiState::default()
+                    };
+                    let line = shortcut_line(&state, width);
+                    let status = footer_status(&state, width);
 
-                assert!(
-                    line.width() <= width as usize,
-                    "shortcuts overflow at width {width} for {focus:?}"
-                );
-                assert!(
-                    status.width() <= width as usize,
-                    "status overflows at width {width} for {focus:?}"
-                );
+                    assert!(
+                        line.width() <= width as usize,
+                        "shortcuts overflow at width {width} for {focus:?}"
+                    );
+                    assert!(
+                        status.width() <= width as usize,
+                        "status overflows at width {width} for {focus:?}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn footer_shortcuts_follow_the_active_popup() {
+        let mut state = UiState::default();
+
+        state.open_popup(Popup::Help);
+        let text = line_text(shortcut_line(&state, 100));
+        assert!(text.contains("Esc close"));
+        assert!(text.contains("q quit"));
+
+        state.open_popup(Popup::ConfirmQuit);
+        let text = line_text(shortcut_line(&state, 100));
+        assert!(text.contains("Enter quit"));
+        assert!(text.contains("Esc cancel"));
     }
 
     fn render_text(state: &mut UiState, area: Rect) -> String {
         let mut buf = Buffer::empty(area);
         render_ui(state, area, &mut buf);
         buffer_text(&buf)
+    }
+
+    fn line_text(line: Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn buffer_text(buf: &Buffer) -> String {

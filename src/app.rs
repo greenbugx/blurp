@@ -77,14 +77,16 @@ impl App {
         };
 
         match popup {
-            Popup::Help => {
-                if matches!(
-                    key_event.code,
-                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter
-                ) {
+            Popup::Help => match key_event.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
                     self.state.close_popup();
                 }
-            }
+                KeyCode::Char('q') => {
+                    self.state.close_popup();
+                    self.state.open_popup(Popup::ConfirmQuit);
+                }
+                _ => {}
+            },
             Popup::ConfirmQuit => match key_event.code {
                 KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.events.send(AppEvent::Quit),
                 KeyCode::Esc
@@ -141,9 +143,31 @@ impl App {
             KeyCode::BackTab => self.state.focus_previous(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Home => self.select_edge(false),
+            KeyCode::End => self.select_edge(true),
             KeyCode::Enter => self.activate_focused(),
             KeyCode::Esc => self.escape_focused(),
             _ => {}
+        }
+    }
+
+    fn select_edge(&mut self, last: bool) {
+        match self.state.focus {
+            Focus::Sidebar => {
+                if last {
+                    self.state.select_last_section();
+                } else {
+                    self.state.select_first_section();
+                }
+            }
+            Focus::DraftList => {
+                if last {
+                    self.state.select_last_draft();
+                } else {
+                    self.state.select_first_draft();
+                }
+            }
+            Focus::Preview | Focus::QuickNote => {}
         }
     }
 
@@ -189,9 +213,8 @@ impl App {
     fn escape_focused(&mut self) {
         match self.state.focus {
             Focus::Sidebar => {}
-            Focus::DraftList | Focus::QuickNote | Focus::Preview => {
-                self.state.focus = Focus::DraftList;
-            }
+            Focus::DraftList => self.state.focus = Focus::Sidebar,
+            Focus::QuickNote | Focus::Preview => self.state.focus = Focus::DraftList,
         }
     }
 
@@ -279,6 +302,113 @@ mod tests {
 
         app.handle_key_events(key(KeyCode::Enter)).unwrap();
         assert_eq!(app.state.focus, Focus::DraftList);
+    }
+
+    #[tokio::test]
+    async fn arrow_keys_match_j_and_k() {
+        let mut app = App::new();
+
+        app.handle_key_events(key(KeyCode::Down)).unwrap();
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Invoice follow-up")
+        );
+
+        app.handle_key_events(key(KeyCode::Up)).unwrap();
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Running late tonight")
+        );
+    }
+
+    #[tokio::test]
+    async fn home_and_end_jump_to_list_edges() {
+        let mut app = App::new();
+
+        app.handle_key_events(key(KeyCode::End)).unwrap();
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Monday submission")
+        );
+
+        app.handle_key_events(key(KeyCode::Home)).unwrap();
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Running late tonight")
+        );
+
+        app.state.focus = Focus::Sidebar;
+        app.handle_key_events(key(KeyCode::End)).unwrap();
+        assert_eq!(app.state.section, Section::Settings);
+
+        app.handle_key_events(key(KeyCode::Home)).unwrap();
+        assert_eq!(app.state.section, Section::Inbox);
+    }
+
+    #[tokio::test]
+    async fn escape_walks_back_toward_the_sidebar() {
+        let mut app = App::new();
+
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.focus, Focus::Sidebar);
+
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.focus, Focus::Sidebar);
+    }
+
+    #[tokio::test]
+    async fn shift_tab_cycles_focus_backwards() {
+        let mut app = App::new();
+
+        app.handle_key_events(key(KeyCode::BackTab)).unwrap();
+        assert_eq!(app.state.focus, Focus::Sidebar);
+
+        app.handle_key_events(key(KeyCode::BackTab)).unwrap();
+        assert_eq!(app.state.focus, Focus::QuickNote);
+    }
+
+    #[tokio::test]
+    async fn q_from_help_opens_quit_confirmation() {
+        let mut app = App::new();
+
+        app.handle_key_events(key(KeyCode::Char('?'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::Help));
+
+        app.handle_key_events(key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::ConfirmQuit));
+        assert!(app.running);
+
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.popup, None);
+        assert!(app.running);
+    }
+
+    #[tokio::test]
+    async fn keyboard_only_flow_reaches_every_workspace_pane() {
+        let mut app = App::new();
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.state.focus, Focus::Preview);
+
+        app.handle_key_events(key(KeyCode::Tab)).unwrap();
+        assert_eq!(app.state.focus, Focus::QuickNote);
+
+        app.handle_key_events(key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(app.state.quick_note_text(), "q");
+
+        app.handle_key_events(key(KeyCode::Tab)).unwrap();
+        assert_eq!(app.state.focus, Focus::Sidebar);
+
+        app.handle_key_events(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(app.state.section, Section::Drafts);
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.state.focus, Focus::DraftList);
+
+        app.handle_key_events(key(KeyCode::Char('?'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::Help));
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.popup, None);
     }
 
     #[tokio::test]

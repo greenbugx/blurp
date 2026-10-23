@@ -69,6 +69,7 @@ impl Popup {
                 "n                 new brain dump\n\
                  Tab / Shift+Tab   switch pane\n\
                  j / k, up / down  move selection\n\
+                 Home / End        first / last item\n\
                  Enter             open / select\n\
                  Esc               back\n\
                  ?                 this help\n\
@@ -234,14 +235,27 @@ impl UiState {
         self.select_section_offset(-1);
     }
 
+    pub fn select_first_section(&mut self) {
+        self.select_section_index(0);
+    }
+
+    pub fn select_last_section(&mut self) {
+        self.select_section_index(Section::ALL.len() - 1);
+    }
+
     fn select_section_offset(&mut self, delta: isize) {
         let count = Section::ALL.len();
         let current = self.sections.selected().unwrap_or(self.section.index());
         let current = current.min(count - 1);
         let next = (current as isize + delta).rem_euclid(count as isize) as usize;
 
-        self.sections.select(Some(next));
-        self.section = Section::ALL[next];
+        self.select_section_index(next);
+    }
+
+    fn select_section_index(&mut self, index: usize) {
+        let index = index.min(Section::ALL.len() - 1);
+        self.sections.select(Some(index));
+        self.section = Section::ALL[index];
         self.selector_changed();
     }
 
@@ -314,6 +328,21 @@ impl UiState {
             _ => count - 1,
         };
         self.draft_list.select(Some(next));
+    }
+
+    pub fn select_first_draft(&mut self) {
+        if self.visible_draft_count() == 0 {
+            self.draft_list.select(None);
+            return;
+        }
+
+        self.draft_list.select(Some(0));
+        *self.draft_list.offset_mut() = 0;
+    }
+
+    pub fn select_last_draft(&mut self) {
+        let count = self.visible_draft_count();
+        self.draft_list.select(count.checked_sub(1));
     }
 
     pub fn start_compose(&mut self) {
@@ -510,6 +539,40 @@ mod tests {
         assert_eq!(
             state.selected_draft().map(|draft| draft.title.as_str()),
             Some("Running late tonight")
+        );
+    }
+
+    #[test]
+    fn first_and_last_section_shortcuts_jump_to_edges() {
+        let mut state = UiState::default();
+
+        state.select_last_section();
+        assert_eq!(state.section, Section::Settings);
+        assert_eq!(state.sections.selected(), Some(Section::Settings.index()));
+        assert_eq!(state.draft_list.selected(), None);
+
+        state.select_first_section();
+        assert_eq!(state.section, Section::Inbox);
+        assert_eq!(state.sections.selected(), Some(Section::Inbox.index()));
+        assert_eq!(state.draft_list.selected(), Some(0));
+    }
+
+    #[test]
+    fn first_and_last_draft_shortcuts_respect_the_section() {
+        let mut state = UiState::default();
+
+        state.select_last_draft();
+        assert_eq!(state.draft_list.selected(), Some(2));
+
+        state.select_first_draft();
+        assert_eq!(state.draft_list.selected(), Some(0));
+
+        state.select_next_section();
+        state.select_last_draft();
+        assert_eq!(state.draft_list.selected(), Some(1));
+        assert_eq!(
+            state.selected_draft().map(|draft| draft.status),
+            Some(DraftStatus::Draft)
         );
     }
 
