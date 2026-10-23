@@ -25,8 +25,20 @@ const DRAFT: Color = Color::Rgb(180, 220, 205);
 const SNOOZED: Color = Color::Rgb(150, 176, 214);
 const DONE: Color = Color::Rgb(120, 160, 148);
 
-const MIN_WIDTH: u16 = 80;
-const MIN_HEIGHT: u16 = 18;
+const MIN_WIDTH: u16 = 48;
+const MIN_HEIGHT: u16 = 10;
+const FULL_WIDTH: u16 = 80;
+const FULL_HEIGHT: u16 = 18;
+const COMPACT_WIDTH: u16 = 56;
+const COMPACT_HEIGHT: u16 = 14;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HomeLayout {
+    TooSmall,
+    Focused,
+    Compact,
+    Full,
+}
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -49,12 +61,16 @@ fn render_ui(state: &mut UiState, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
-    if too_small(area) {
-        render_too_small(area, buf);
-        return;
+    match home_layout(area) {
+        HomeLayout::TooSmall => render_too_small(area, buf),
+        HomeLayout::Focused => render_focused_home(state, area, buf),
+        HomeLayout::Compact => render_compact_home(state, area, buf),
+        HomeLayout::Full => render_full_home(state, area, buf),
     }
+}
 
-    let [main, footer] = Layout::vertical([Constraint::Min(6), Constraint::Length(2)]).areas(area);
+fn render_full_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
+    let (main, footer) = split_footer(area);
     let [workspace, quick_note] =
         Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(main);
     let [sidebar, drafts, preview] = Layout::horizontal([
@@ -69,6 +85,67 @@ fn render_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
     render_preview(state, preview, buf);
     render_quick_note(state, quick_note, buf);
     render_footer(state, footer, buf);
+}
+
+fn render_compact_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
+    let (main, footer) = split_footer(area);
+
+    match state.focus {
+        Focus::Sidebar => {
+            let [sidebar, drafts] =
+                Layout::horizontal([Constraint::Length(20), Constraint::Fill(1)]).areas(main);
+
+            render_sidebar(state, sidebar, buf);
+            render_draft_list(state, drafts, buf);
+        }
+        Focus::DraftList | Focus::Preview => {
+            let [drafts, preview] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(main);
+
+            render_draft_list(state, drafts, buf);
+            render_preview(state, preview, buf);
+        }
+        Focus::QuickNote => render_quick_note(state, main, buf),
+    }
+
+    render_footer(state, footer, buf);
+}
+
+fn render_focused_home(state: &mut UiState, area: Rect, buf: &mut Buffer) {
+    let (main, footer) = split_footer(area);
+
+    match state.focus {
+        Focus::Sidebar => {
+            let [sidebar, drafts] =
+                Layout::horizontal([Constraint::Length(20), Constraint::Fill(1)]).areas(main);
+
+            render_sidebar(state, sidebar, buf);
+            render_draft_list(state, drafts, buf);
+        }
+        Focus::DraftList => render_draft_list(state, main, buf),
+        Focus::Preview => render_preview(state, main, buf),
+        Focus::QuickNote => render_quick_note(state, main, buf),
+    }
+
+    render_footer(state, footer, buf);
+}
+
+fn split_footer(area: Rect) -> (Rect, Rect) {
+    let [main, footer] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
+
+    (main, footer)
+}
+
+fn home_layout(area: Rect) -> HomeLayout {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        HomeLayout::TooSmall
+    } else if area.width >= FULL_WIDTH && area.height >= FULL_HEIGHT {
+        HomeLayout::Full
+    } else if area.width >= COMPACT_WIDTH && area.height >= COMPACT_HEIGHT {
+        HomeLayout::Compact
+    } else {
+        HomeLayout::Focused
+    }
 }
 
 fn render_sidebar(state: &mut UiState, area: Rect, buf: &mut Buffer) {
@@ -224,60 +301,112 @@ fn render_footer(state: &UiState, area: Rect, buf: &mut Buffer) {
     let [shortcuts, status] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
-    Paragraph::new(shortcut_line(state)).render(shortcuts, buf);
-    Paragraph::new(footer_status(state)).render(status, buf);
+    Paragraph::new(shortcut_line(state, area.width)).render(shortcuts, buf);
+    Paragraph::new(footer_status(state, area.width)).render(status, buf);
 }
 
-fn shortcut_line(state: &UiState) -> Line<'static> {
-    let pairs: &[(&str, &str)] = if state.popup.is_some() {
-        &[("Esc", "close"), ("Enter", "confirm where shown")]
+fn shortcut_line(state: &UiState, width: u16) -> Line<'static> {
+    let pairs = if width < 72 {
+        narrow_shortcuts(state)
     } else {
-        match state.screen {
-            Screen::Compose => &[("type", "freely"), ("Esc", "back, text kept")],
-            Screen::Settings => &[("Esc", "back"), ("?", "help"), ("q", "quit")],
-            Screen::Home => match state.focus {
-                Focus::Sidebar => &[
-                    ("j/k", "section"),
-                    ("Enter", "open"),
-                    ("Tab", "pane"),
-                    ("n", "new"),
-                    ("?", "help"),
-                    ("q", "quit"),
-                ],
-                Focus::DraftList => &[
-                    ("j/k", "move"),
-                    ("Enter", "open"),
-                    ("Tab", "pane"),
-                    ("n", "new"),
-                    ("?", "help"),
-                    ("q", "quit"),
-                ],
-                Focus::Preview => &[
-                    ("Esc", "back"),
-                    ("Tab", "pane"),
-                    ("n", "new"),
-                    ("?", "help"),
-                    ("q", "quit"),
-                ],
-                Focus::QuickNote => &[("type", "note"), ("Esc", "done"), ("Tab", "pane")],
-            },
-        }
+        full_shortcuts(state)
     };
 
-    let mut spans = Vec::new();
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1usize;
+
     for (index, (key, action)) in pairs.iter().enumerate() {
+        let separator_width = if index == 0 { 0 } else { 3 };
+        let chunk_width = separator_width + key.chars().count() + 1 + action.chars().count();
+
+        if used + chunk_width > width as usize {
+            break;
+        }
+
         if index > 0 {
             spans.push(Span::styled(" · ", Style::default().fg(BORDER)));
         }
         spans.push(Span::styled(*key, Style::default().fg(ACCENT)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(*action, Style::default().fg(MUTED)));
+        used += chunk_width;
     }
 
     Line::from(spans)
 }
 
-fn footer_status(state: &UiState) -> Line<'static> {
+fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
+    if state.popup.is_some() {
+        return &[("Esc", "close"), ("Enter", "confirm where shown")];
+    }
+
+    match state.screen {
+        Screen::Compose => &[("type", "freely"), ("Esc", "back, text kept")],
+        Screen::Settings => &[("Esc", "back"), ("?", "help"), ("q", "quit")],
+        Screen::Home => match state.focus {
+            Focus::Sidebar => &[
+                ("j/k", "section"),
+                ("Enter", "open"),
+                ("Tab", "pane"),
+                ("n", "new"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Focus::DraftList => &[
+                ("j/k", "move"),
+                ("Enter", "open"),
+                ("Tab", "pane"),
+                ("n", "new"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Focus::Preview => &[
+                ("Esc", "back"),
+                ("Tab", "pane"),
+                ("n", "new"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Focus::QuickNote => &[("type", "note"), ("Esc", "done"), ("Tab", "pane")],
+        },
+    }
+}
+
+fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
+    if state.popup.is_some() {
+        return &[("Esc", "close")];
+    }
+
+    match state.screen {
+        Screen::Compose => &[("Esc", "back, text kept")],
+        Screen::Settings => &[("Esc", "back"), ("q", "quit")],
+        Screen::Home => match state.focus {
+            Focus::Sidebar => &[
+                ("j/k", "section"),
+                ("Enter", "open"),
+                ("Tab", "pane"),
+                ("q", "quit"),
+            ],
+            Focus::DraftList => &[
+                ("Enter", "open"),
+                ("Tab", "pane"),
+                ("n", "new"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Focus::Preview => &[
+                ("Esc", "back"),
+                ("Tab", "pane"),
+                ("n", "new"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Focus::QuickNote => &[("type", "note"), ("Esc", "done"), ("Tab", "pane")],
+        },
+    }
+}
+
+fn footer_status(state: &UiState, width: u16) -> Line<'static> {
     if let Some(error) = &state.error {
         return Line::from(vec![
             Span::styled(" ! ", Style::default().fg(ERROR)),
@@ -299,12 +428,15 @@ fn footer_status(state: &UiState) -> Line<'static> {
         ));
     }
 
+    let sample_status = if width < 72 {
+        "sample drafts · not saved yet"
+    } else {
+        "sample drafts in memory · nothing is saved yet"
+    };
+
     Line::from(vec![
         Span::styled(" ● ", Style::default().fg(ACCENT)),
-        Span::styled(
-            "sample drafts in memory · nothing is saved yet",
-            Style::default().fg(MUTED),
-        ),
+        Span::styled(sample_status, Style::default().fg(MUTED)),
     ])
 }
 
@@ -493,7 +625,7 @@ fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
 }
 
 fn too_small(area: Rect) -> bool {
-    area.width < MIN_WIDTH || area.height < MIN_HEIGHT
+    home_layout(area) == HomeLayout::TooSmall
 }
 
 #[cfg(test)]
@@ -502,7 +634,20 @@ mod tests {
 
     #[test]
     fn rendering_is_safe_across_sizes_screens_and_popups() {
-        let sizes = [(1, 1), (20, 5), (79, 17), (80, 18), (120, 40)];
+        let sizes = [
+            (1, 1),
+            (20, 5),
+            (47, 9),
+            (48, 10),
+            (55, 13),
+            (56, 14),
+            (70, 20),
+            (79, 17),
+            (79, 40),
+            (80, 17),
+            (80, 18),
+            (120, 40),
+        ];
         let screens = [Screen::Home, Screen::Compose, Screen::Settings];
         let popups = [
             None,
@@ -531,17 +676,19 @@ mod tests {
     #[test]
     fn rendering_each_focused_pane_is_safe() {
         for focus in Focus::ALL {
-            let mut state = UiState {
-                focus,
-                ..UiState::default()
-            };
-            state.draft_list.select(Some(1));
-            state.error = Some("a readable error".to_string());
-            state.generation = crate::state::GenerationState::Generating;
+            for (width, height) in [(50, 16), (70, 20), (100, 30)] {
+                let mut state = UiState {
+                    focus,
+                    ..UiState::default()
+                };
+                state.draft_list.select(Some(1));
+                state.error = Some("a readable error".to_string());
+                state.generation = crate::state::GenerationState::Generating;
 
-            let area = Rect::new(0, 0, 100, 30);
-            let mut buf = Buffer::empty(area);
-            render_ui(&mut state, area, &mut buf);
+                let area = Rect::new(0, 0, width, height);
+                let mut buf = Buffer::empty(area);
+                render_ui(&mut state, area, &mut buf);
+            }
         }
     }
 
@@ -605,6 +752,99 @@ mod tests {
                 "highlight should cover line {offset}"
             );
         }
+    }
+
+    #[test]
+    fn layout_breakpoints_are_explicit() {
+        assert_eq!(home_layout(Rect::new(0, 0, 80, 18)), HomeLayout::Full);
+        assert_eq!(home_layout(Rect::new(0, 0, 79, 18)), HomeLayout::Compact);
+        assert_eq!(home_layout(Rect::new(0, 0, 56, 14)), HomeLayout::Compact);
+        assert_eq!(home_layout(Rect::new(0, 0, 55, 14)), HomeLayout::Focused);
+        assert_eq!(home_layout(Rect::new(0, 0, 48, 10)), HomeLayout::Focused);
+        assert_eq!(home_layout(Rect::new(0, 0, 47, 10)), HomeLayout::TooSmall);
+        assert_eq!(home_layout(Rect::new(0, 0, 120, 13)), HomeLayout::Focused);
+    }
+
+    #[test]
+    fn full_layout_keeps_all_three_panes_and_the_quick_note() {
+        let mut state = UiState::default();
+        let text = render_text(&mut state, Rect::new(0, 0, 80, 18));
+
+        assert!(text.contains("blurp"));
+        assert!(text.contains("Inbox · 3"));
+        assert!(text.contains("Preview"));
+        assert!(text.contains("Quick note"));
+    }
+
+    #[test]
+    fn compact_layout_collapses_the_pane_that_is_not_focused() {
+        let mut state = UiState::default();
+        let text = render_text(&mut state, Rect::new(0, 0, 70, 20));
+
+        assert!(text.contains("Inbox · 3"));
+        assert!(text.contains("Preview"));
+        assert!(!text.contains("Quick note"));
+        assert!(!text.contains("blurp"));
+
+        state.focus = Focus::Sidebar;
+        let text = render_text(&mut state, Rect::new(0, 0, 70, 20));
+
+        assert!(text.contains("blurp"));
+        assert!(!text.contains("Preview"));
+    }
+
+    #[test]
+    fn narrow_layout_shows_only_the_focused_pane() {
+        let mut state = UiState::default();
+        let text = render_text(&mut state, Rect::new(0, 0, 50, 16));
+
+        assert!(text.contains("Inbox · 3"));
+        assert!(!text.contains("Preview"));
+        assert!(!text.contains("Quick note"));
+
+        state.focus = Focus::Preview;
+        let text = render_text(&mut state, Rect::new(0, 0, 50, 16));
+
+        assert!(text.contains("Preview"));
+        assert!(text.contains("can't make it tonight"));
+    }
+
+    #[test]
+    fn tiny_layout_explains_the_minimum_size() {
+        let mut state = UiState::default();
+        let text = render_text(&mut state, Rect::new(0, 0, 47, 9));
+
+        assert!(text.contains("Terminal too small"));
+        assert!(text.contains("48×10"));
+    }
+
+    #[test]
+    fn footer_shortcuts_fit_the_available_width() {
+        for width in [48, 56, 70, 72, 80, 120] {
+            for focus in Focus::ALL {
+                let state = UiState {
+                    focus,
+                    ..UiState::default()
+                };
+                let line = shortcut_line(&state, width);
+                let status = footer_status(&state, width);
+
+                assert!(
+                    line.width() <= width as usize,
+                    "shortcuts overflow at width {width} for {focus:?}"
+                );
+                assert!(
+                    status.width() <= width as usize,
+                    "status overflows at width {width} for {focus:?}"
+                );
+            }
+        }
+    }
+
+    fn render_text(state: &mut UiState, area: Rect) -> String {
+        let mut buf = Buffer::empty(area);
+        render_ui(state, area, &mut buf);
+        buffer_text(&buf)
     }
 
     fn buffer_text(buf: &Buffer) -> String {
