@@ -22,6 +22,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 thiserror = "2.0.21"
 uuid = { version = "1.28.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
+tui-textarea = "0.7.0"
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]
