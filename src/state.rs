@@ -228,9 +228,7 @@ impl UiState {
 
 fn composer_editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
-    editor.set_placeholder_text(
-        "Dump it all here.\n\nTell Anya I can't make it tonight, ask Dev about the invoice...\n\nCtrl+S to review when you're done.",
-    );
+    editor.set_placeholder_text("Dump it all here. One dump can hold several messages.");
     editor.set_placeholder_style(Style::default().fg(Color::DarkGray));
     editor
 }
