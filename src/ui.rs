@@ -372,18 +372,79 @@ fn render_settings(state: &UiState, area: Rect, buf: &mut Buffer) {
     }
 
     let [body, footer] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
-    let block = pane_block("Settings", false);
+    let block = pane_block("Settings", true);
     let inner = block.inner(body);
     block.render(body, buf);
 
-    Paragraph::new(
-        "Model selection, storage location, and other preferences will live here.\n\n\
-         Nothing is sent to a cloud service. Press Esc to return to the workspace.",
-    )
-    .style(Style::default().fg(MUTED))
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: true })
-    .render(inner, buf);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Model ", Style::default().fg(MUTED)),
+            Span::styled(
+                state.settings_current_model.clone().unwrap_or_default(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if let Some(error) = &state.settings_models_error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(ERROR),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Press r to retry.",
+            Style::default().fg(MUTED),
+        )));
+    } else if let Some(models) = &state.settings_models {
+        if models.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Ollama reported no installed models.\nPull one with `ollama pull <model>` and press r.",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            let selected_index = state.settings_model_list.selected();
+            for (index, model) in models.iter().enumerate() {
+                let selected = selected_index == Some(index);
+                let marker = if selected { "> " } else { "  " };
+                let suffix = if state.settings_current_model.as_deref() == Some(model.as_str()) {
+                    "  (in use)"
+                } else {
+                    ""
+                };
+                let style = if selected {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}{model}{suffix}"),
+                    style,
+                )));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter switches the model for this and future sessions. j / k to choose. r refreshes.",
+                Style::default().fg(MUTED),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Loading models from Ollama...",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press Esc to return to the workspace.",
+        Style::default().fg(MUTED),
+    )));
+
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
 
     render_footer(state, footer, buf);
 }
@@ -464,7 +525,14 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
             ("?", "help"),
         ],
         Screen::Edit => &[("type", "freely"), ("Ctrl+S", "save"), ("Esc", "cancel")],
-        Screen::Settings => &[("Esc", "back"), ("?", "help"), ("q", "quit")],
+        Screen::Settings => &[
+            ("j/k", "choose"),
+            ("Enter", "use"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         Screen::Home => match state.focus {
             Focus::Sidebar => &[
                 ("j/k", "section"),
@@ -528,7 +596,12 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
             ("Esc", "back"),
         ],
         Screen::Edit => &[("Ctrl+S", "save"), ("Esc", "cancel")],
-        Screen::Settings => &[("Esc", "back"), ("q", "quit")],
+        Screen::Settings => &[
+            ("Enter", "use"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ],
         Screen::Home => match state.focus {
             Focus::Sidebar => &[
                 ("j/k", "section"),
@@ -968,6 +1041,22 @@ mod tests {
         assert!(text.contains("No draft selected."));
         assert!(text.contains("local-only · nothing saved yet"));
         assert!(!text.contains("sample drafts"));
+    }
+
+    #[test]
+    fn settings_renders_the_model_list_with_the_current_marker() {
+        let mut state = UiState::demo();
+        state.open_settings("gemma4:e4b".to_string());
+        state.apply_models(vec![
+            "gemma4:e4b".to_string(),
+            "gemma4-long:latest".to_string(),
+        ]);
+
+        let text = render_text(&mut state, Rect::new(0, 0, 80, 24));
+
+        assert!(text.contains("(in use)"));
+        assert!(text.contains("gemma4-long:latest"));
+        assert!(text.contains("Enter switches the model"));
     }
 
     #[test]

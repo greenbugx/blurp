@@ -2,7 +2,7 @@ use crate::contract::{Draft, DraftBatch, DraftRequest};
 use crate::db::Store;
 use crate::draft::{DraftCard, DraftStatus, Tone};
 use crate::event::{AppEvent, Event, EventHandler};
-use crate::ollama::{OllamaClient, OllamaConfig, OllamaError};
+use crate::ollama::{MODEL_ENV, OllamaClient, OllamaConfig, OllamaError};
 use crate::state::{Focus, Popup, Screen, Section, UiState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
@@ -18,6 +18,7 @@ pub struct App {
     pub store: Option<Store>,
     drafting: Option<JoinHandle<()>>,
     redrafting: Option<JoinHandle<()>>,
+    models_task: Option<JoinHandle<()>>,
     generation_id: u64,
 }
 
@@ -31,6 +32,7 @@ impl App {
             store: None,
             drafting: None,
             redrafting: None,
+            models_task: None,
             generation_id: 0,
         }
     }
@@ -47,6 +49,11 @@ impl App {
             })
             .collect();
         let mut app = Self::base(UiState::with_drafts(cards));
+        if let Some(saved) = store.model_setting()?
+            && std::env::var(MODEL_ENV).is_err()
+        {
+            app.client_config.model = saved;
+        }
         app.store = Some(store);
 
         Ok(app)
@@ -77,6 +84,7 @@ impl App {
                         draft_id,
                         result,
                     } => self.on_redraft_result(id, draft_id, result),
+                    AppEvent::ModelsResult { result } => self.on_models_result(result),
                 },
             }
         }
@@ -238,8 +246,68 @@ impl App {
             KeyCode::Esc => self.state.leave_settings(),
             KeyCode::Char('?') => self.state.open_popup(Popup::Help),
             KeyCode::Char('q') => self.state.open_popup(Popup::ConfirmQuit),
+            KeyCode::Char('r') => {
+                self.state.retry_models();
+                self.fetch_models();
+            }
+            KeyCode::Enter => self.choose_selected_model(),
+            KeyCode::Down | KeyCode::Char('j') => self.state.select_next_model(),
+            KeyCode::Up | KeyCode::Char('k') => self.state.select_previous_model(),
             _ => {}
         }
+    }
+
+    fn fetch_models(&mut self) {
+        if self.models_task.is_some() {
+            return;
+        }
+
+        let client = match OllamaClient::new(self.client_config.clone()) {
+            Ok(client) => client,
+            Err(error) => {
+                self.state.fail_models(error.to_string());
+                return;
+            }
+        };
+
+        let sender = self.events.sender();
+        self.models_task = Some(tokio::spawn(async move {
+            let result = client.models().await;
+            let _ = sender.send(Event::App(AppEvent::ModelsResult { result }));
+        }));
+    }
+
+    fn on_models_result(&mut self, result: Result<Vec<String>, OllamaError>) {
+        self.models_task = None;
+
+        match result {
+            Ok(models) => self.state.apply_models(models),
+            Err(error) => self.state.fail_models(error.to_string()),
+        }
+    }
+
+    fn choose_selected_model(&mut self) {
+        let Some(name) = self.state.selected_model_name() else {
+            return;
+        };
+        if name == self.client_config.model {
+            return;
+        }
+
+        if let Some(store) = &self.store
+            && let Err(error) = store.set_model_setting(&name)
+        {
+            self.state.set_error(error.to_string());
+            return;
+        }
+
+        self.client_config.model = name.clone();
+        self.state.settings_current_model = Some(name.clone());
+        if let Some(models) = self.state.settings_models.clone() {
+            self.state.apply_models(models);
+        }
+        self.state.error = None;
+        self.state.notice = Some(format!("Model switched to {name}"));
     }
 
     fn handle_quick_note_key(&mut self, key_event: KeyEvent) {
@@ -632,7 +700,9 @@ impl App {
         match self.state.focus {
             Focus::Sidebar => {
                 if self.state.section == Section::Settings {
-                    self.state.open_settings();
+                    let model = self.client_config.model.clone();
+                    self.state.open_settings(model);
+                    self.fetch_models();
                 } else {
                     self.state.focus = Focus::DraftList;
                 }
@@ -902,6 +972,76 @@ mod tests {
         app.handle_key_events(key(KeyCode::Esc)).unwrap();
         assert_eq!(app.state.search_query, "");
         assert_eq!(app.state.visible_draft_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_settings_screen_lists_and_switches_models() {
+        let reply = serde_json::json!({
+            "models": [
+                {"name": "gemma4-long:latest"},
+                {"name": "gemma4:e4b"}
+            ]
+        })
+        .to_string();
+        let (base_url, _) = crate::ollama::harness::serve_once(
+            crate::ollama::harness::http_response(200, "OK", &reply),
+        )
+        .await;
+        let mut app = stored_app();
+        app.client_config =
+            OllamaConfig::resolve(Some(base_url), Some("gemma4:e4b".to_string()), None);
+
+        app.state.section = Section::Settings;
+        app.state.focus = Focus::Sidebar;
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.state.screen, Screen::Settings);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.models_task.take().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match app.events.try_next_app().expect("models event") {
+            AppEvent::ModelsResult { result } => app.on_models_result(result),
+            other => panic!("unexpected event {other:?}"),
+        }
+        assert_eq!(
+            app.state.settings_models.as_deref(),
+            Some(&["gemma4-long:latest".to_string(), "gemma4:e4b".to_string()] as &[_])
+        );
+        assert_eq!(app.state.settings_model_list.selected(), Some(1));
+
+        app.handle_key_events(key(KeyCode::Char('j'))).unwrap();
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.client_config.model, "gemma4-long:latest");
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .model_setting()
+                .unwrap()
+                .as_deref(),
+            Some("gemma4-long:latest")
+        );
+        assert_eq!(
+            app.state.notice.as_deref(),
+            Some("Model switched to gemma4-long:latest")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saved_model_setting_is_used_when_no_env_override_exists() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_model_setting("gemma4-long:latest").unwrap();
+
+        let app = App::new(store).unwrap();
+
+        if std::env::var(MODEL_ENV).is_err() {
+            assert_eq!(app.client_config.model, "gemma4-long:latest");
+        }
     }
 
     #[tokio::test]

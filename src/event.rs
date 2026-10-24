@@ -27,6 +27,9 @@ pub enum AppEvent {
         draft_id: String,
         result: Result<Draft, OllamaError>,
     },
+    ModelsResult {
+        result: Result<Vec<String>, OllamaError>,
+    },
 }
 
 #[derive(Debug)]

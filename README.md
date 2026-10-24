@@ -37,6 +37,7 @@ Everything stays on your machine.
   never written to storage
 - Recoverable errors for Ollama down, missing model, timeouts, and malformed
   model replies, with the original dump always preserved
+- A settings screen for the model and storage location
 
 ## Planned ideas
 
@@ -44,7 +45,6 @@ Everything stays on your machine.
   and persisted today)
 - Choosing a tone before the first generation (tone selection currently
   applies to per-draft regeneration)
-- A settings screen for the model and storage location
 - Optional `$EDITOR` integration, mouse support, and undo for deletion
 
 ## Requirements

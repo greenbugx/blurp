@@ -82,6 +82,10 @@ impl Store {
                  dump TEXT NOT NULL,
                  created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS settings (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS drafts (
                  id TEXT PRIMARY KEY,
                  batch_id TEXT NOT NULL REFERENCES draft_batches(id) ON DELETE CASCADE,
@@ -217,6 +221,28 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::MissingDraft(draft.id.to_string()));
         }
+
+        Ok(())
+    }
+
+    pub fn model_setting(&self) -> Result<Option<String>, StoreError> {
+        match self.connection.query_row(
+            "SELECT value FROM settings WHERE key = 'model'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn set_model_setting(&self, model: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('model', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![model],
+        )?;
 
         Ok(())
     }
@@ -447,6 +473,20 @@ mod tests {
             store.delete_draft(draft.id),
             Err(StoreError::MissingDraft(_))
         ));
+    }
+
+    #[test]
+    fn the_model_setting_round_trips_and_overwrites() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.model_setting().unwrap(), None);
+
+        store.set_model_setting("gemma4:e4b").unwrap();
+        store.set_model_setting("gemma4-long:latest").unwrap();
+
+        assert_eq!(
+            store.model_setting().unwrap().as_deref(),
+            Some("gemma4-long:latest")
+        );
     }
 
     #[test]

@@ -117,6 +117,29 @@ impl OllamaClient {
             .ok_or(OllamaError::InvalidResponse)
     }
 
+    pub async fn models(&self) -> Result<Vec<String>, OllamaError> {
+        let url = format!("{}/api/tags", self.config.base_url);
+
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| send_error(&self.config.base_url, error))?;
+        let response = self.check(response).await?;
+
+        let tags: TagsResponse = decode(response).await?;
+        let mut names = tags
+            .models
+            .into_iter()
+            .filter_map(|model| model.name)
+            .filter(|name| !name.trim().is_empty())
+            .collect::<Vec<_>>();
+        names.sort();
+
+        Ok(names)
+    }
+
     async fn send_chat(
         &self,
         system_prompt: &str,
@@ -140,39 +163,16 @@ impl OllamaClient {
         };
         let url = format!("{}/api/chat", self.config.base_url);
 
-        let response = match self.http.post(url).json(&chat).send().await {
-            Ok(response) => response,
-            Err(error) if error.is_timeout() => return Err(OllamaError::TimedOut),
-            Err(error) if error.is_connect() => {
-                return Err(OllamaError::NotRunning {
-                    url: self.config.base_url.clone(),
-                });
-            }
-            Err(error) => return Err(OllamaError::Request(error)),
-        };
+        let response = self
+            .http
+            .post(url)
+            .json(&chat)
+            .send()
+            .await
+            .map_err(|error| send_error(&self.config.base_url, error))?;
+        let response = self.check(response).await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let detail = error_detail(response).await;
-            return Err(match status.as_u16() {
-                404 => OllamaError::ModelNotFound {
-                    model: self.config.model.clone(),
-                },
-                code if code >= 500 => OllamaError::ModelError { detail },
-                code => OllamaError::Http {
-                    status: code,
-                    detail,
-                },
-            });
-        }
-
-        let reply: ChatResponse = response.json().await.map_err(|error| {
-            if error.is_decode() {
-                OllamaError::InvalidResponse
-            } else {
-                OllamaError::Request(error)
-            }
-        })?;
+        let reply: ChatResponse = decode(response).await?;
         let content = reply
             .message
             .and_then(|message| message.content)
@@ -181,6 +181,49 @@ impl OllamaClient {
 
         parse_draft_response(request, &content).map_err(OllamaError::Contract)
     }
+
+    async fn check(&self, response: reqwest::Response) -> Result<reqwest::Response, OllamaError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let detail = error_detail(response).await;
+        Err(match status.as_u16() {
+            404 => OllamaError::ModelNotFound {
+                model: self.config.model.clone(),
+            },
+            code if code >= 500 => OllamaError::ModelError { detail },
+            code => OllamaError::Http {
+                status: code,
+                detail,
+            },
+        })
+    }
+}
+
+fn send_error(base_url: &str, error: reqwest::Error) -> OllamaError {
+    if error.is_timeout() {
+        OllamaError::TimedOut
+    } else if error.is_connect() {
+        OllamaError::NotRunning {
+            url: base_url.to_string(),
+        }
+    } else {
+        OllamaError::Request(error)
+    }
+}
+
+async fn decode<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, OllamaError> {
+    response.json().await.map_err(|error| {
+        if error.is_decode() {
+            OllamaError::InvalidResponse
+        } else {
+            OllamaError::Request(error)
+        }
+    })
 }
 
 async fn error_detail(response: reqwest::Response) -> String {
@@ -193,6 +236,17 @@ async fn error_detail(response: reqwest::Response) -> String {
                 .and_then(|error| error.as_str().map(str::to_string))
         })
         .unwrap_or(text)
+}
+
+#[derive(Deserialize)]
+struct TagsResponse {
+    #[serde(default)]
+    models: Vec<TaggedModel>,
+}
+
+#[derive(Deserialize)]
+struct TaggedModel {
+    name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -439,6 +493,29 @@ mod tests {
         let error = client.draft(&request).await.unwrap_err();
         assert!(matches!(error, OllamaError::NotRunning { .. }));
         assert!(error.to_string().contains("ollama serve"));
+    }
+
+    #[tokio::test]
+    async fn models_lists_installed_models_sorted() {
+        let reply = serde_json::json!({
+            "models": [
+                {"name": "gemma4-long:latest"},
+                {"name": "gemma4:e4b"}
+            ]
+        })
+        .to_string();
+        let (base_url, received) = serve_once(http_response(200, "OK", &reply)).await;
+        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None, None)).unwrap();
+
+        let models = client.models().await.unwrap();
+
+        assert_eq!(
+            models,
+            vec!["gemma4-long:latest".to_string(), "gemma4:e4b".to_string()]
+        );
+
+        let sent = received.await.unwrap();
+        assert!(sent.starts_with("GET /api/tags"));
     }
 
     #[tokio::test]

@@ -213,6 +213,11 @@ pub struct UiState {
     pub search_input: bool,
     pub search_query: String,
 
+    pub settings_models: Option<Vec<String>>,
+    pub settings_models_error: Option<String>,
+    pub settings_model_list: ListState,
+    pub settings_current_model: Option<String>,
+
     pub generation: GenerationState,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -241,6 +246,10 @@ impl Default for UiState {
             pending_tone: None,
             search_input: false,
             search_query: String::new(),
+            settings_models: None,
+            settings_models_error: None,
+            settings_model_list: ListState::default(),
+            settings_current_model: None,
             generation: GenerationState::Idle,
             error: None,
             notice: None,
@@ -719,9 +728,69 @@ impl UiState {
         self.composer = composer_editor();
     }
 
-    pub fn open_settings(&mut self) {
+    pub fn open_settings(&mut self, current_model: String) {
         self.popup = None;
         self.screen = Screen::Settings;
+        self.settings_models = None;
+        self.settings_models_error = None;
+        self.settings_model_list = ListState::default();
+        self.settings_current_model = Some(current_model);
+    }
+
+    pub const fn models_loading(&self) -> bool {
+        self.settings_models.is_none() && self.settings_models_error.is_none()
+    }
+
+    pub fn apply_models(&mut self, models: Vec<String>) {
+        let selected = self
+            .settings_current_model
+            .as_deref()
+            .and_then(|current| models.iter().position(|model| model == current))
+            .unwrap_or(0);
+        self.settings_model_list.select(Some(selected));
+        self.settings_models = Some(models);
+        self.settings_models_error = None;
+    }
+
+    pub fn fail_models(&mut self, message: String) {
+        self.settings_models = None;
+        self.settings_models_error = Some(message);
+    }
+
+    pub fn retry_models(&mut self) {
+        self.settings_models = None;
+        self.settings_models_error = None;
+    }
+
+    pub fn select_next_model(&mut self) {
+        self.move_model_selection(1);
+    }
+
+    pub fn select_previous_model(&mut self) {
+        self.move_model_selection(-1);
+    }
+
+    fn move_model_selection(&mut self, delta: isize) {
+        let Some(models) = &self.settings_models else {
+            return;
+        };
+        let count = models.len();
+        if count == 0 {
+            return;
+        }
+
+        let current = self
+            .settings_model_list
+            .selected()
+            .unwrap_or(0)
+            .min(count - 1);
+        let next = (current as isize + delta).rem_euclid(count as isize) as usize;
+        self.settings_model_list.select(Some(next));
+    }
+
+    pub fn selected_model_name(&self) -> Option<String> {
+        let index = self.settings_model_list.selected()?;
+        self.settings_models.as_ref()?.get(index).cloned()
     }
 
     pub fn leave_settings(&mut self) {
