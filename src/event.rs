@@ -80,6 +80,19 @@ impl EventHandler {
     pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
         self.sender.clone()
     }
+
+    pub fn drain_stale_input(&mut self) {
+        let mut kept = Vec::new();
+        while let Ok(event) = self.receiver.try_recv() {
+            match event {
+                Event::Crossterm(_) => {}
+                other => kept.push(other),
+            }
+        }
+        for event in kept {
+            let _ = self.sender.send(event);
+        }
+    }
 }
 
 impl Default for EventHandler {

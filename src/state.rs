@@ -88,6 +88,7 @@ impl Popup {
                  m                 mark done / undo\n\
                  z                 snooze / wake\n\
                  d                 delete draft\n\
+                 v                 open draft in $EDITOR\n\
                  /                 search drafts\n\
                  Esc               back\n\
                  ?                 this help\n\
@@ -589,6 +590,12 @@ impl UiState {
 
     pub fn editor_text(&self) -> String {
         self.editor.lines().join("\n")
+    }
+
+    pub fn replace_editor_text(&mut self, text: String) {
+        let mut editor = TextArea::default();
+        editor.insert_str(text);
+        self.editor = editor;
     }
 
     pub fn input_editor(&mut self, input: Input) {
@@ -1205,6 +1212,18 @@ mod tests {
         state.complete_drafting(vec![card("Only")]);
 
         assert_eq!(state.selected_draft().unwrap().title, "Only");
+    }
+
+    #[test]
+    fn replacing_editor_text_flags_the_draft_for_save() {
+        let mut state = UiState::demo();
+        state.start_editing();
+        assert!(!state.edit_text_changed());
+
+        state.replace_editor_text("Edited in an external editor.".to_string());
+
+        assert_eq!(state.editor_text(), "Edited in an external editor.");
+        assert!(state.edit_text_changed());
     }
 
     #[test]

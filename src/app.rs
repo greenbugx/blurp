@@ -72,7 +72,10 @@ impl App {
                     crossterm::event::Event::Key(key_event)
                         if key_event.kind == crossterm::event::KeyEventKind::Press =>
                     {
-                        self.handle_key_events(key_event)?
+                        let wants_editor = self.handle_key_events(key_event)?;
+                        if wants_editor {
+                            self.handle_external_editor(&mut terminal)?;
+                        }
                     }
                     _ => {}
                 },
@@ -91,28 +94,28 @@ impl App {
         Ok(())
     }
 
-    pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+    pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<bool> {
         if key_event.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key_event.code, KeyCode::Char('c' | 'C'))
         {
             self.events.send(AppEvent::Quit);
-            return Ok(());
+            return Ok(false);
         }
 
         if self.state.popup_is_open() {
             self.handle_popup_key(key_event);
-            return Ok(());
+            return Ok(false);
         }
 
         if self.state.search_input {
             self.handle_search_key(key_event);
-            return Ok(());
+            return Ok(false);
         }
 
         match self.state.screen {
             Screen::Compose => self.handle_compose_key(key_event),
             Screen::Review => self.handle_review_key(key_event),
-            Screen::Edit => self.handle_edit_key(key_event),
+            Screen::Edit => return self.handle_edit_key(key_event),
             Screen::Settings => self.handle_settings_key(key_event),
             Screen::Home if self.state.focus == Focus::QuickNote => {
                 self.handle_quick_note_key(key_event);
@@ -120,7 +123,7 @@ impl App {
             Screen::Home => self.handle_home_key(key_event),
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn handle_popup_key(&mut self, key_event: KeyEvent) {
@@ -355,7 +358,7 @@ impl App {
             && !self.state.generation.is_generating()
     }
 
-    fn handle_edit_key(&mut self, key_event: KeyEvent) {
+    fn handle_edit_key(&mut self, key_event: KeyEvent) -> color_eyre::Result<bool> {
         match key_event.code {
             KeyCode::Esc => {
                 if self.state.edit_text_changed() {
@@ -367,11 +370,70 @@ impl App {
             KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.save_edit();
             }
+            KeyCode::Char('v') => return Ok(true),
             _ => {
                 self.state.clear_error();
                 self.state.input_editor(key_event.into());
             }
         }
+
+        Ok(false)
+    }
+
+    fn handle_external_editor(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
+        match external_editor() {
+            Some(command) => self.run_external_editor(command, terminal),
+            None => {
+                self.state
+                    .set_error("Set $EDITOR or $VISUAL to open your terminal editor.");
+                Ok(())
+            }
+        }
+    }
+
+    fn run_external_editor(
+        &mut self,
+        (program, args): (String, Vec<String>),
+        terminal: &mut DefaultTerminal,
+    ) -> color_eyre::Result<()> {
+        let body = self.state.editor_text();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let path =
+            std::env::temp_dir().join(format!("blurp-draft-{}-{stamp}.txt", std::process::id()));
+        std::fs::write(&path, &body)?;
+
+        ratatui::restore();
+        let status = {
+            let mut command = std::process::Command::new(&program);
+            command.args(&args).arg(&path);
+            command.status()
+        };
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        self.events.drain_stale_input();
+        terminal.clear()?;
+
+        match status {
+            Ok(status) if status.success() => {
+                let text = std::fs::read_to_string(&path).unwrap_or(body);
+                self.state.replace_editor_text(text);
+                self.state.error = None;
+                self.state.notice =
+                    Some("Draft updated in your editor. Ctrl+S saves it.".to_string());
+            }
+            Ok(status) => self
+                .state
+                .set_error(format!("{program} exited with {status}")),
+            Err(error) => self
+                .state
+                .set_error(format!("Could not launch {program}: {error}")),
+        }
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     fn handle_search_key(&mut self, key_event: KeyEvent) {
@@ -737,6 +799,25 @@ fn is_review_shortcut(key_event: KeyEvent) -> bool {
             && matches!(key_event.code, KeyCode::Char('s' | 'S') | KeyCode::Enter))
 }
 
+fn external_editor() -> Option<(String, Vec<String>)> {
+    external_editor_from(
+        std::env::var("BLURP_EDITOR").ok(),
+        std::env::var("VISUAL").ok(),
+        std::env::var("EDITOR").ok(),
+    )
+}
+
+fn external_editor_from(
+    blurp: Option<String>,
+    visual: Option<String>,
+    editor: Option<String>,
+) -> Option<(String, Vec<String>)> {
+    let spec = blurp.or(visual).or(editor)?;
+    let mut parts = spec.split_whitespace();
+    let program = parts.next()?;
+    Some((program.to_string(), parts.map(str::to_string).collect()))
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
     let mut clipboard = arboard::Clipboard::new()?;
     clipboard.set_text(text.to_string())?;
@@ -1085,6 +1166,62 @@ mod tests {
             other => panic!("unexpected event {other:?}"),
         }
         assert!(!app.running);
+    }
+
+    #[test]
+    fn the_editor_command_prefers_blurp_editor_then_visual_then_editor() {
+        assert!(external_editor_from(None, None, None).is_none());
+        assert!(external_editor_from(Some("   ".to_string()), None, None).is_none());
+
+        let (program, args) = external_editor_from(Some("nvim".to_string()), None, None).unwrap();
+        assert_eq!(program, "nvim");
+        assert!(args.is_empty());
+
+        let (program, args) =
+            external_editor_from(Some("code -w --wait".to_string()), None, None).unwrap();
+        assert_eq!(program, "code");
+        assert_eq!(args, vec!["-w".to_string(), "--wait".to_string()]);
+
+        let (program, _) =
+            external_editor_from(None, Some("kak".to_string()), Some("nano".to_string())).unwrap();
+        assert_eq!(program, "kak");
+
+        let (program, _) = external_editor_from(None, None, Some("nano".to_string())).unwrap();
+        assert_eq!(program, "nano");
+    }
+
+    #[tokio::test]
+    async fn pressing_v_in_the_editor_requests_the_external_editor() {
+        let mut app = stored_app();
+
+        app.state.start_editing();
+        let before = app.state.editor_text();
+
+        let wants_editor = app.handle_key_events(key(KeyCode::Char('v'))).unwrap();
+
+        assert!(wants_editor);
+        assert_eq!(app.state.editor_text(), before, "v must not be typed");
+    }
+
+    #[test]
+    fn draining_stale_input_keeps_app_events_and_drops_keystrokes() {
+        let mut events = EventHandler::new();
+        events.send(AppEvent::Quit);
+        events
+            .sender()
+            .send(Event::Crossterm(crossterm::event::Event::FocusGained))
+            .unwrap();
+
+        events.drain_stale_input();
+
+        match events.try_next_app() {
+            Some(AppEvent::Quit) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            events.try_next_app().is_none(),
+            "stale input must not survive"
+        );
     }
 
     #[tokio::test]

@@ -524,7 +524,12 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
             ("Esc", "workspace"),
             ("?", "help"),
         ],
-        Screen::Edit => &[("type", "freely"), ("Ctrl+S", "save"), ("Esc", "cancel")],
+        Screen::Edit => &[
+            ("type", "freely"),
+            ("Ctrl+S", "save"),
+            ("v", "editor"),
+            ("Esc", "cancel"),
+        ],
         Screen::Settings => &[
             ("j/k", "choose"),
             ("Enter", "use"),
@@ -595,7 +600,7 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
             ("x", "discard"),
             ("Esc", "back"),
         ],
-        Screen::Edit => &[("Ctrl+S", "save"), ("Esc", "cancel")],
+        Screen::Edit => &[("Ctrl+S", "save"), ("v", "editor"), ("Esc", "cancel")],
         Screen::Settings => &[
             ("Enter", "use"),
             ("r", "refresh"),
