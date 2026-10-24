@@ -386,6 +386,16 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
     }
 
     match state.screen {
+        Screen::Home if state.generation.is_generating() => match state.focus {
+            Focus::QuickNote => &[("type", "note"), ("Esc", "done"), ("Tab", "pane")],
+            _ => &[
+                ("j/k", "move"),
+                ("Tab", "pane"),
+                ("Esc", "cancel"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+        },
         Screen::Compose => &[
             ("type", "freely"),
             ("Ctrl+S", "review"),
@@ -440,6 +450,10 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
     }
 
     match state.screen {
+        Screen::Home if state.generation.is_generating() => match state.focus {
+            Focus::QuickNote => &[("type", "note"), ("Esc", "done"), ("Tab", "pane")],
+            _ => &[("Tab", "pane"), ("Esc", "cancel"), ("q", "quit")],
+        },
         Screen::Compose => &[("Ctrl+S", "review"), ("Esc", "workspace")],
         Screen::Review => &[
             ("Enter", "submit"),
@@ -484,7 +498,7 @@ fn footer_status(state: &UiState, width: u16) -> Line<'static> {
 
     if state.generation.is_generating() {
         return Line::from(Span::styled(
-            " Generating locally with Ollama...",
+            " Generating with Ollama... Esc to cancel",
             Style::default().fg(ACCENT),
         ));
     }
@@ -516,9 +530,15 @@ fn footer_status(state: &UiState, width: u16) -> Line<'static> {
         ]);
     }
 
+    let status = if state.drafts.is_empty() {
+        "local-only · nothing saved yet"
+    } else {
+        "local-only · drafts persist on this machine"
+    };
+
     Line::from(vec![
         Span::styled(" ● ", Style::default().fg(MUTED)),
-        Span::styled("local-only · nothing saved yet", Style::default().fg(MUTED)),
+        Span::styled(status, Style::default().fg(MUTED)),
     ])
 }
 
@@ -820,6 +840,27 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_distinguishes_empty_and_persisted_workspaces() {
+        let mut state = UiState::default();
+
+        let empty = line_text(footer_status(&state, 120));
+        assert!(empty.contains("nothing saved yet"));
+
+        state.drafts.push(DraftCard {
+            id: "1".to_string(),
+            title: "Saved draft".to_string(),
+            recipient: None,
+            tone: crate::draft::Tone::Casual,
+            status: DraftStatus::Review,
+            body: String::new(),
+        });
+
+        let loaded = line_text(footer_status(&state, 120));
+        assert!(loaded.contains("persist on this machine"));
+        assert!(!loaded.contains("nothing saved yet"));
+    }
+
+    #[test]
     fn quit_prompt_mentions_sample_data_only_in_demo_mode() {
         let mut demo = UiState::demo();
         demo.open_popup(Popup::ConfirmQuit);
@@ -1061,7 +1102,7 @@ mod tests {
         for width in [48, 56, 72, 80, 120] {
             let width_u16 = width as u16;
             let mut state = UiState {
-                notice: Some("Dump ready · local drafting not connected".to_string()),
+                notice: Some("3 drafts saved".to_string()),
                 ..UiState::demo()
             };
             assert!(footer_status(&state, width_u16).width() <= width);
@@ -1070,6 +1111,11 @@ mod tests {
             assert!(footer_status(&state, width_u16).width() <= width);
 
             state.notice = None;
+            state.generation = crate::state::GenerationState::Generating;
+            assert!(footer_status(&state, width_u16).width() <= width);
+            assert!(line_text(footer_status(&state, width_u16)).contains("cancel"));
+
+            state.generation = crate::state::GenerationState::Idle;
             state.screen = Screen::Review;
             assert!(footer_status(&state, width_u16).width() <= width);
             assert!(line_text(shortcut_line(&state, width_u16)).contains("submit"));
@@ -1077,6 +1123,16 @@ mod tests {
             let empty = UiState::default();
             assert!(footer_status(&empty, width_u16).width() <= width);
         }
+    }
+
+    #[test]
+    fn drafting_footer_offers_cancel_instead_of_a_new_dump() {
+        let mut state = UiState::demo();
+        state.generation = crate::state::GenerationState::Generating;
+
+        let shortcuts = line_text(shortcut_line(&state, 120));
+        assert!(shortcuts.contains("Esc cancel"));
+        assert!(!shortcuts.contains("n new"));
     }
 
     fn render_text(state: &mut UiState, area: Rect) -> String {

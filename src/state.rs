@@ -224,6 +224,16 @@ impl UiState {
 
         state
     }
+
+    pub fn with_drafts(cards: Vec<DraftCard>) -> Self {
+        let mut state = Self {
+            drafts: cards,
+            ..Self::default()
+        };
+        state.sync_draft_selection();
+
+        state
+    }
 }
 
 fn composer_editor() -> TextArea<'static> {
@@ -415,20 +425,50 @@ impl UiState {
         self.screen = Screen::Compose;
     }
 
-    pub fn submit_compose(&mut self) -> bool {
+    pub fn start_drafting(&mut self) -> bool {
+        if self.generation.is_generating() {
+            return false;
+        }
         if self.composer_text().trim().is_empty() {
             self.set_error("Add a thought before submitting.");
             return false;
         }
 
         self.popup = None;
-        self.error = None;
         self.review_scroll = 0;
-        self.notice = Some("Dump ready · local drafting not connected".to_string());
         self.screen = Screen::Home;
         self.focus = Focus::DraftList;
+        self.begin_generation();
 
         true
+    }
+
+    pub fn complete_drafting(&mut self, cards: Vec<DraftCard>) {
+        let count = cards.len();
+        let selected_id = self.selected_draft().map(|draft| draft.id.clone());
+        for card in cards {
+            self.drafts.insert(0, card);
+        }
+        self.generation = GenerationState::Idle;
+        self.error = None;
+        self.review_scroll = 0;
+        self.composer = composer_editor();
+        let noun = if count == 1 { "draft" } else { "drafts" };
+        self.notice = Some(format!("{count} {noun} saved"));
+        self.restore_selection(selected_id.as_deref());
+    }
+
+    fn restore_selection(&mut self, id: Option<&str>) {
+        let index = id
+            .and_then(|id| self.visible_drafts().position(|draft| draft.id == id))
+            .or_else(|| (self.visible_draft_count() > 0).then_some(0));
+        self.draft_list.select(index);
+    }
+
+    pub fn cancel_generation(&mut self) {
+        self.generation = GenerationState::Idle;
+        self.error = None;
+        self.notice = Some("Drafting cancelled. Dump kept.".to_string());
     }
 
     pub fn discard_compose(&mut self) {
@@ -775,14 +815,11 @@ mod tests {
         assert!(state.composer_text().contains("Ask Dev"));
 
         assert!(state.start_review());
-        assert!(state.submit_compose());
+        assert!(state.start_drafting());
         assert_eq!(state.screen, Screen::Home);
         assert_eq!(state.focus, Focus::DraftList);
+        assert!(state.generation.is_generating());
         assert!(state.composer_text().contains("Ask Dev"));
-        assert_eq!(
-            state.notice.as_deref(),
-            Some("Dump ready · local drafting not connected")
-        );
     }
 
     #[test]
@@ -806,13 +843,102 @@ mod tests {
         );
 
         state.screen = Screen::Review;
-        assert!(!state.submit_compose());
+        assert!(!state.start_drafting());
         assert_eq!(state.screen, Screen::Review);
         assert_eq!(
             state.error.as_deref(),
             Some("Add a thought before submitting.")
         );
         assert_eq!(state.composer_text().trim(), "");
+    }
+
+    #[test]
+    fn completed_drafting_adds_cards_and_clears_the_composer() {
+        let mut state = UiState::default();
+        state.start_compose();
+        state.composer.insert_str("tell sam i cant make it tonight");
+        assert!(state.start_drafting());
+
+        state.complete_drafting(vec![card("Cancel tonight")]);
+
+        assert_eq!(state.generation, GenerationState::Idle);
+        assert!(state.composer_text().is_empty());
+        assert_eq!(state.notice.as_deref(), Some("1 draft saved"));
+        assert_eq!(state.drafts.len(), 1);
+        assert_eq!(state.drafts[0].title, "Cancel tonight");
+        assert_eq!(state.draft_list.selected(), Some(0));
+        assert!(state.section.accepts(state.drafts[0].status));
+    }
+
+    #[test]
+    fn completed_drafting_counts_and_orders_multiple_cards() {
+        let mut state = UiState::default();
+
+        state.complete_drafting(vec![card("First"), card("Second")]);
+
+        assert_eq!(state.notice.as_deref(), Some("2 drafts saved"));
+        assert_eq!(state.drafts[0].title, "Second");
+        assert_eq!(state.drafts[1].title, "First");
+    }
+
+    #[test]
+    fn cancelling_and_failing_drafting_keep_the_dump() {
+        let mut state = UiState::default();
+        state.start_compose();
+        state.composer.insert_str("keep me");
+        assert!(state.start_drafting());
+
+        state.cancel_generation();
+        assert_eq!(state.generation, GenerationState::Idle);
+        assert!(state.error.is_none());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Drafting cancelled. Dump kept.")
+        );
+        assert_eq!(state.composer_text(), "keep me");
+
+        assert!(state.start_drafting());
+        state.fail_generation("Ollama is not reachable");
+        assert_eq!(state.generation, GenerationState::Idle);
+        assert_eq!(state.error.as_deref(), Some("Ollama is not reachable"));
+        assert!(state.notice.is_none());
+        assert_eq!(state.composer_text(), "keep me");
+    }
+
+    #[test]
+    fn completing_a_run_keeps_the_selected_draft_by_id() {
+        let mut state = UiState::demo();
+        state.select_next_draft(state.visible_draft_count());
+        assert_eq!(state.selected_draft().unwrap().title, "Invoice follow-up");
+
+        state.complete_drafting(vec![card("Newest")]);
+
+        assert_eq!(state.drafts[0].title, "Newest");
+        assert_eq!(
+            state.selected_draft().unwrap().title,
+            "Invoice follow-up",
+            "selection must follow the id, not the position"
+        );
+    }
+
+    #[test]
+    fn completing_into_an_empty_workspace_selects_the_first_new_draft() {
+        let mut state = UiState::default();
+
+        state.complete_drafting(vec![card("Only")]);
+
+        assert_eq!(state.selected_draft().unwrap().title, "Only");
+    }
+
+    fn card(title: &str) -> DraftCard {
+        DraftCard {
+            id: title.to_lowercase().replace(' ', "-"),
+            title: title.to_string(),
+            recipient: None,
+            tone: crate::draft::Tone::Casual,
+            status: DraftStatus::Review,
+            body: "body".to_string(),
+        }
     }
 
     #[test]

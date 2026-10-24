@@ -1,3 +1,5 @@
+use crate::contract::DraftBatch;
+use crate::ollama::OllamaError;
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
@@ -6,43 +8,69 @@ use tokio::sync::mpsc;
 
 const TICK_FPS: f64 = 30.0;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Event {
     Tick,
     Crossterm(CrosstermEvent),
     App(AppEvent),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum AppEvent {
     Quit,
+    DraftResult {
+        id: u64,
+        result: Result<DraftBatch, OllamaError>,
+    },
 }
 
 #[derive(Debug)]
 pub struct EventHandler {
     sender: mpsc::UnboundedSender<Event>,
     receiver: mpsc::UnboundedReceiver<Event>,
+    actor: Option<EventTask>,
 }
 
 impl EventHandler {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let actor = EventTask::new(sender.clone());
-        tokio::spawn(async { actor.run().await });
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            actor: Some(actor),
+        }
     }
 
     pub async fn next(&mut self) -> color_eyre::Result<Event> {
+        if let Some(actor) = self.actor.take() {
+            tokio::spawn(async move { actor.run().await });
+        }
         self.receiver
             .recv()
             .await
             .ok_or_eyre("Failed to receive event")
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_next_app(&mut self) -> Option<AppEvent> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(Event::App(app_event)) => return Some(app_event),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
     pub fn send(&mut self, app_event: AppEvent) {
         // Ignore the result as the reciever cannot be dropped while this struct still has a
         // reference to it
         let _ = self.sender.send(Event::App(app_event));
+    }
+
+    pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
+        self.sender.clone()
     }
 }
 
@@ -52,6 +80,7 @@ impl Default for EventHandler {
     }
 }
 
+#[derive(Debug)]
 struct EventTask {
     sender: mpsc::UnboundedSender<Event>,
 }
