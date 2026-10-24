@@ -2,11 +2,21 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/dependabot.yml'
   push:
     branches:
       - main
       - master
       - develop
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/dependabot.yml'
 
 env:
   CARGO_TERM_COLOR: always
