@@ -1,6 +1,8 @@
 use crate::contract::{
-    ContractError, DraftBatch, DraftRequest, SYSTEM_PROMPT, parse_draft_response,
+    ContractError, Draft, DraftBatch, DraftRequest, REGENERATE_PROMPT, SYSTEM_PROMPT,
+    parse_draft_response, regenerate_message,
 };
+use crate::draft::Tone;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::Duration;
@@ -10,18 +12,24 @@ pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 pub const DEFAULT_MODEL: &str = "gemma4:e4b";
 pub const BASE_URL_ENV: &str = "BLURP_OLLAMA_URL";
 pub const MODEL_ENV: &str = "BLURP_MODEL";
+pub const TIMEOUT_ENV: &str = "BLURP_TIMEOUT_SECONDS";
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OllamaConfig {
     pub base_url: String,
     pub model: String,
+    pub timeout: Duration,
 }
 
 impl OllamaConfig {
-    pub fn resolve(base_url: Option<String>, model: Option<String>) -> Self {
+    pub fn resolve(
+        base_url: Option<String>,
+        model: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Self {
         Self {
             base_url: base_url
                 .or_else(|| env::var(BASE_URL_ENV).ok())
@@ -33,13 +41,21 @@ impl OllamaConfig {
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string())
                 .trim()
                 .to_string(),
+            timeout: timeout
+                .or_else(|| {
+                    env::var(TIMEOUT_ENV)
+                        .ok()
+                        .and_then(|seconds| seconds.trim().parse().ok())
+                        .map(Duration::from_secs)
+                })
+                .unwrap_or(DEFAULT_TIMEOUT),
         }
     }
 }
 
 impl Default for OllamaConfig {
     fn default() -> Self {
-        Self::resolve(None, None)
+        Self::resolve(None, None, None)
     }
 }
 
@@ -71,7 +87,7 @@ pub struct OllamaClient {
 impl OllamaClient {
     pub fn new(config: OllamaConfig) -> Result<Self, OllamaError> {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(config.timeout)
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(OllamaError::Request)?;
@@ -80,16 +96,43 @@ impl OllamaClient {
     }
 
     pub async fn draft(&self, request: &DraftRequest) -> Result<DraftBatch, OllamaError> {
+        self.send_chat(SYSTEM_PROMPT, request.user_message(), request)
+            .await
+    }
+
+    pub async fn redraft(&self, dump: &str, body: &str, tone: Tone) -> Result<Draft, OllamaError> {
+        let request = DraftRequest::new(dump.to_string(), Some(tone))?;
+        let batch = self
+            .send_chat(
+                REGENERATE_PROMPT,
+                regenerate_message(dump, body, tone),
+                &request,
+            )
+            .await?;
+
+        batch
+            .drafts
+            .into_iter()
+            .next()
+            .ok_or(OllamaError::InvalidResponse)
+    }
+
+    async fn send_chat(
+        &self,
+        system_prompt: &str,
+        user_message: String,
+        request: &DraftRequest,
+    ) -> Result<DraftBatch, OllamaError> {
         let chat = ChatRequest {
             model: &self.config.model,
             messages: vec![
                 ChatMessage {
                     role: "system",
-                    content: SYSTEM_PROMPT.to_string(),
+                    content: system_prompt.to_string(),
                 },
                 ChatMessage {
                     role: "user",
-                    content: request.user_message(),
+                    content: user_message,
                 },
             ],
             stream: false,
@@ -178,6 +221,7 @@ struct ChatReplyMessage {
 
 #[cfg(test)]
 pub(crate) mod harness {
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
 
@@ -223,6 +267,33 @@ pub(crate) mod harness {
         })
     }
 
+    pub async fn serve_slow(response: String, delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&received);
+                if text.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        format!("http://{addr}")
+    }
+
     pub fn http_response(status: u16, reason: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -235,20 +306,24 @@ pub(crate) mod harness {
 mod tests {
     use super::*;
     use crate::draft::{DraftStatus, Tone};
-    use harness::{http_response, serve_once};
+    use harness::{http_response, serve_once, serve_slow};
+    use std::time::Duration;
 
     #[test]
     fn config_resolves_explicit_values_then_env_then_defaults() {
         let config = OllamaConfig::resolve(
             Some("http://127.0.0.1:9999/".to_string()),
             Some(" test-model ".to_string()),
+            Some(Duration::from_secs(7)),
         );
         assert_eq!(config.base_url, "http://127.0.0.1:9999");
         assert_eq!(config.model, "test-model");
+        assert_eq!(config.timeout, Duration::from_secs(7));
 
-        let config = OllamaConfig::resolve(None, None);
+        let config = OllamaConfig::resolve(None, None, None);
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.model, DEFAULT_MODEL);
+        assert_eq!(config.timeout, DEFAULT_TIMEOUT);
     }
 
     #[tokio::test]
@@ -262,6 +337,7 @@ mod tests {
         let client = OllamaClient::new(OllamaConfig::resolve(
             Some(base_url),
             Some("test-model".to_string()),
+            None,
         ))
         .unwrap();
         let request = DraftRequest::new("tell sam i cant make it tonight", None).unwrap();
@@ -295,6 +371,7 @@ mod tests {
         let client = OllamaClient::new(OllamaConfig::resolve(
             Some(base_url),
             Some("missing-model".to_string()),
+            None,
         ))
         .unwrap();
         let request = DraftRequest::new("hello", None).unwrap();
@@ -309,7 +386,7 @@ mod tests {
         let reply = serde_json::json!({"error": "tokenizer exploded"}).to_string();
         let (base_url, _) = serve_once(http_response(500, "Internal Server Error", &reply)).await;
 
-        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None)).unwrap();
+        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None, None)).unwrap();
         let request = DraftRequest::new("hello", None).unwrap();
 
         let error = client.draft(&request).await.unwrap_err();
@@ -321,7 +398,7 @@ mod tests {
     async fn an_empty_ollama_reply_is_rejected() {
         let (base_url, _) = serve_once(http_response(200, "OK", "{}")).await;
 
-        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None)).unwrap();
+        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None, None)).unwrap();
         let request = DraftRequest::new("hello", None).unwrap();
 
         let error = client.draft(&request).await.unwrap_err();
@@ -334,7 +411,7 @@ mod tests {
             .to_string();
         let (base_url, _) = serve_once(http_response(200, "OK", &reply)).await;
 
-        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None)).unwrap();
+        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None, None)).unwrap();
         let request = DraftRequest::new("hello", None).unwrap();
 
         let error = client.draft(&request).await.unwrap_err();
@@ -351,13 +428,41 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let client =
-            OllamaClient::new(OllamaConfig::resolve(Some(format!("http://{addr}")), None)).unwrap();
+        let client = OllamaClient::new(OllamaConfig::resolve(
+            Some(format!("http://{addr}")),
+            None,
+            None,
+        ))
+        .unwrap();
         let request = DraftRequest::new("hello", None).unwrap();
 
         let error = client.draft(&request).await.unwrap_err();
         assert!(matches!(error, OllamaError::NotRunning { .. }));
         assert!(error.to_string().contains("ollama serve"));
+    }
+
+    #[tokio::test]
+    async fn a_slow_reply_times_out_with_a_readable_error() {
+        let reply =
+            serde_json::json!({"message": {"role": "assistant", "content": "{}"}, "done": true})
+                .to_string();
+        let base_url = harness::serve_slow(
+            harness::http_response(200, "OK", &reply),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let client = OllamaClient::new(OllamaConfig::resolve(
+            Some(base_url),
+            None,
+            Some(Duration::from_millis(200)),
+        ))
+        .unwrap();
+        let request = DraftRequest::new("hello", None).unwrap();
+
+        let error = client.draft(&request).await.unwrap_err();
+        assert!(matches!(error, OllamaError::TimedOut));
+        assert!(error.to_string().contains("did not reply in time"));
     }
 
     #[tokio::test]
@@ -378,5 +483,53 @@ mod tests {
             assert!(!draft.body.is_empty());
         }
         println!("{}", serde_json::to_string_pretty(&batch).unwrap());
+    }
+
+    #[tokio::test]
+    async fn redraft_uses_the_regenerate_prompt_and_the_requested_tone() {
+        let content = r#"{"drafts":[{"id":"1","title":"Cancel tonight","recipient":"Sam","body":"Hey Sam, I can't make it tonight. Does Thursday work instead?","tone":"casual","missingDetails":[],"status":"draft"}]}"#;
+        let reply =
+            serde_json::json!({"message": {"role": "assistant", "content": content}, "done": true})
+                .to_string();
+        let (base_url, received) = serve_once(http_response(200, "OK", &reply)).await;
+
+        let client = OllamaClient::new(OllamaConfig::resolve(Some(base_url), None, None)).unwrap();
+
+        let draft = client
+            .redraft("tell sam", "old body", Tone::Firm)
+            .await
+            .unwrap();
+
+        assert_eq!(draft.tone, Tone::Firm);
+
+        let sent = received.await.unwrap();
+        let (_, body) = sent.split_once("\r\n\r\n").unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["messages"][0]["content"], REGENERATE_PROMPT);
+        assert!(
+            json["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Requested tone: firm")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn redrafts_with_the_real_local_ollama() {
+        let client = OllamaClient::new(OllamaConfig::default()).unwrap();
+
+        let draft = client
+            .redraft(
+                "tell anya i cant make it tonight",
+                "Hey Anya, I can't make it tonight.",
+                Tone::Firm,
+            )
+            .await
+            .expect("live redraft failed");
+
+        assert_eq!(draft.tone, Tone::Firm);
+        assert!(!draft.body.is_empty());
+        println!("{}", serde_json::to_string_pretty(&draft).unwrap());
     }
 }

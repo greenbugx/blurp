@@ -1,4 +1,4 @@
-use crate::contract::DraftBatch;
+use crate::contract::{Draft, DraftBatch};
 use crate::ollama::OllamaError;
 use color_eyre::eyre::OptionExt;
 use crossterm::event::Event as CrosstermEvent;
@@ -21,6 +21,11 @@ pub enum AppEvent {
     DraftResult {
         id: u64,
         result: Result<DraftBatch, OllamaError>,
+    },
+    RedraftResult {
+        id: u64,
+        draft_id: String,
+        result: Result<Draft, OllamaError>,
     },
 }
 

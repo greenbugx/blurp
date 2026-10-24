@@ -39,13 +39,19 @@ pub struct Store {
     connection: Connection,
 }
 
+#[derive(Debug)]
+pub struct StoredDraft {
+    pub draft: Draft,
+    pub dump: String,
+    pub edited: bool,
+}
+
 impl std::fmt::Debug for Store {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Store").finish_non_exhaustive()
     }
 }
 
-#[allow(dead_code)]
 impl Store {
     pub fn open() -> Result<Self, StoreError> {
         let path = database_path().ok_or(StoreError::NoDataDirectory)?;
@@ -63,6 +69,7 @@ impl Store {
         Self::init(Connection::open(path)?)
     }
 
+    #[allow(dead_code)]
     pub fn open_in_memory() -> Result<Self, StoreError> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -84,9 +91,22 @@ impl Store {
                  body TEXT NOT NULL,
                  tone TEXT NOT NULL,
                  status TEXT NOT NULL,
-                 missing_details TEXT NOT NULL
+                 missing_details TEXT NOT NULL,
+                 edited INTEGER NOT NULL DEFAULT 0
              );",
         )?;
+
+        let has_edited: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('drafts') WHERE name = 'edited'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_edited == 0 {
+            connection.execute(
+                "ALTER TABLE drafts ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
 
         Ok(Self { connection })
     }
@@ -125,9 +145,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn drafts(&self) -> Result<Vec<Draft>, StoreError> {
+    pub fn drafts(&self) -> Result<Vec<StoredDraft>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT d.id, d.title, d.recipient, d.body, d.tone, d.status, d.missing_details
+            "SELECT d.id, d.title, d.recipient, d.body, d.tone, d.status, d.missing_details,
+                    d.edited, b.dump
              FROM drafts d
              JOIN draft_batches b ON d.batch_id = b.id
              ORDER BY b.created_at DESC, d.position ASC",
@@ -141,6 +162,8 @@ impl Store {
                 tone: row.get(4)?,
                 status: row.get(5)?,
                 missing_details: row.get(6)?,
+                edited: row.get::<_, i64>(7)? != 0,
+                dump: row.get(8)?,
             })
         })?;
 
@@ -151,10 +174,35 @@ impl Store {
         Ok(drafts)
     }
 
+    pub fn update_draft_body(&self, id: Uuid, body: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE drafts SET body = ?1, edited = 1 WHERE id = ?2",
+            params![body, id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::MissingDraft(id.to_string()));
+        }
+
+        Ok(())
+    }
+
+    pub fn update_draft_status(&self, id: Uuid, status: DraftStatus) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE drafts SET status = ?1 WHERE id = ?2",
+            params![status.label(), id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::MissingDraft(id.to_string()));
+        }
+
+        Ok(())
+    }
+
     pub fn update_draft(&self, draft: &Draft) -> Result<(), StoreError> {
         let changed = self.connection.execute(
             "UPDATE drafts
-             SET title = ?1, recipient = ?2, body = ?3, tone = ?4, status = ?5, missing_details = ?6
+             SET title = ?1, recipient = ?2, body = ?3, tone = ?4, status = ?5,
+                 missing_details = ?6, edited = 0
              WHERE id = ?7",
             params![
                 draft.title,
@@ -193,23 +241,31 @@ struct RawDraft {
     tone: String,
     status: String,
     missing_details: String,
+    edited: bool,
+    dump: String,
 }
 
-fn draft_from_raw(raw: RawDraft) -> Result<Draft, StoreError> {
-    Ok(Draft {
-        id: Uuid::parse_str(&raw.id).map_err(|_| StoreError::InvalidId(raw.id.clone()))?,
-        title: raw.title,
-        recipient: raw.recipient,
-        body: raw.body,
-        tone: Tone::from_label(&raw.tone).ok_or_else(|| StoreError::InvalidEnum {
-            field: "tone",
-            value: raw.tone.clone(),
-        })?,
-        status: DraftStatus::from_label(&raw.status).ok_or_else(|| StoreError::InvalidEnum {
-            field: "status",
-            value: raw.status.clone(),
-        })?,
-        missing_details: serde_json::from_str(&raw.missing_details)?,
+fn draft_from_raw(raw: RawDraft) -> Result<StoredDraft, StoreError> {
+    Ok(StoredDraft {
+        edited: raw.edited,
+        dump: raw.dump,
+        draft: Draft {
+            id: Uuid::parse_str(&raw.id).map_err(|_| StoreError::InvalidId(raw.id.clone()))?,
+            title: raw.title,
+            recipient: raw.recipient,
+            body: raw.body,
+            tone: Tone::from_label(&raw.tone).ok_or_else(|| StoreError::InvalidEnum {
+                field: "tone",
+                value: raw.tone.clone(),
+            })?,
+            status: DraftStatus::from_label(&raw.status).ok_or_else(|| {
+                StoreError::InvalidEnum {
+                    field: "status",
+                    value: raw.status.clone(),
+                }
+            })?,
+            missing_details: serde_json::from_str(&raw.missing_details)?,
+        },
     })
 }
 
@@ -246,6 +302,10 @@ mod tests {
         }
     }
 
+    fn drafts_of(stored: &[StoredDraft]) -> Vec<Draft> {
+        stored.iter().map(|item| item.draft.clone()).collect()
+    }
+
     fn temp_database_path() -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -255,6 +315,14 @@ mod tests {
             "blurp-tests-{}/nested/blurp-{unique}.sqlite3",
             std::process::id()
         ))
+    }
+
+    #[test]
+    #[ignore]
+    fn opens_the_real_local_database() {
+        let store = Store::open().unwrap();
+
+        assert!(store.drafts().is_ok());
     }
 
     #[test]
@@ -278,7 +346,10 @@ mod tests {
 
         store.save_batch(&batch).unwrap();
 
-        assert_eq!(store.drafts().unwrap(), batch.drafts);
+        let stored = store.drafts().unwrap();
+        assert_eq!(drafts_of(&stored), batch.drafts);
+        assert!(stored.iter().all(|item| !item.edited));
+        assert_eq!(stored[0].dump, batch.dump);
     }
 
     #[test]
@@ -291,7 +362,7 @@ mod tests {
         store.save_batch(&older).unwrap();
         store.save_batch(&newer).unwrap();
 
-        let drafts = store.drafts().unwrap();
+        let drafts = drafts_of(&store.drafts().unwrap());
         assert_eq!(drafts[0].id, newer.drafts[0].id);
         assert_eq!(drafts[1].id, newer.drafts[1].id);
         assert_eq!(drafts[2].id, older.drafts[0].id);
@@ -313,7 +384,36 @@ mod tests {
         draft.missing_details = vec!["New question".to_string()];
         store.update_draft(&draft).unwrap();
 
-        assert_eq!(store.drafts().unwrap()[0], draft);
+        assert_eq!(drafts_of(&store.drafts().unwrap())[0], draft);
+        assert!(!store.drafts().unwrap()[0].edited);
+    }
+
+    #[test]
+    fn editing_the_body_persists_and_marks_the_draft() {
+        let store = Store::open_in_memory().unwrap();
+        let batch = sample_batch();
+        store.save_batch(&batch).unwrap();
+
+        store
+            .update_draft_body(batch.drafts[0].id, "Handwritten update")
+            .unwrap();
+        store
+            .update_draft_status(batch.drafts[0].id, DraftStatus::Snoozed)
+            .unwrap();
+
+        let stored = store.drafts().unwrap();
+        assert_eq!(stored[0].draft.body, "Handwritten update");
+        assert_eq!(stored[0].draft.status, DraftStatus::Snoozed);
+        assert!(stored[0].edited);
+        assert_eq!(stored[0].draft.title, "Cancel tonight");
+        assert!(matches!(
+            store.update_draft_body(Uuid::new_v4(), "nope"),
+            Err(StoreError::MissingDraft(_))
+        ));
+        assert!(matches!(
+            store.update_draft_status(Uuid::new_v4(), DraftStatus::Review),
+            Err(StoreError::MissingDraft(_))
+        ));
     }
 
     #[test]
@@ -324,7 +424,10 @@ mod tests {
 
         store.delete_draft(batch.drafts[0].id).unwrap();
 
-        assert_eq!(store.drafts().unwrap(), vec![batch.drafts[1].clone()]);
+        assert_eq!(
+            drafts_of(&store.drafts().unwrap()),
+            vec![batch.drafts[1].clone()]
+        );
         assert!(matches!(
             store.delete_draft(batch.drafts[0].id),
             Err(StoreError::MissingDraft(_))
@@ -347,6 +450,19 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_database_in_an_unwritable_location_fails_cleanly() {
+        let blocker =
+            std::env::temp_dir().join(format!("blurp-blocker-{}.txt", std::process::id()));
+        std::fs::write(&blocker, "not a directory").unwrap();
+
+        let result = Store::open_at(&blocker.join("nested/blurp.sqlite3"));
+
+        assert!(matches!(result, Err(StoreError::Directory { .. })));
+
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
     fn a_failing_batch_save_leaves_no_partial_rows() {
         let store = Store::open_in_memory().unwrap();
         let batch = sample_batch();
@@ -359,7 +475,7 @@ mod tests {
 
         assert!(store.save_batch(&clash).is_err());
 
-        let drafts = store.drafts().unwrap();
+        let drafts = drafts_of(&store.drafts().unwrap());
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts[0].id, batch.drafts[0].id);
         assert_ne!(drafts[0].id, fresh_draft.id);
@@ -376,7 +492,7 @@ mod tests {
         }
 
         let reopened = Store::open_at(&path).unwrap();
-        assert_eq!(reopened.drafts().unwrap(), batch.drafts);
+        assert_eq!(drafts_of(&reopened.drafts().unwrap()), batch.drafts);
 
         if let Some(parent) = path.ancestors().nth(2) {
             let _ = std::fs::remove_dir_all(parent);

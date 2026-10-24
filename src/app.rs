@@ -1,12 +1,13 @@
-use crate::contract::{DraftBatch, DraftRequest};
+use crate::contract::{Draft, DraftBatch, DraftRequest};
 use crate::db::Store;
-use crate::draft::DraftCard;
+use crate::draft::{DraftCard, DraftStatus, Tone};
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::ollama::{OllamaClient, OllamaConfig, OllamaError};
 use crate::state::{Focus, Popup, Screen, Section, UiState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct App {
@@ -16,6 +17,7 @@ pub struct App {
     pub client_config: OllamaConfig,
     pub store: Option<Store>,
     drafting: Option<JoinHandle<()>>,
+    redrafting: Option<JoinHandle<()>>,
     generation_id: u64,
 }
 
@@ -28,12 +30,22 @@ impl App {
             client_config: OllamaConfig::default(),
             store: None,
             drafting: None,
+            redrafting: None,
             generation_id: 0,
         }
     }
 
     pub fn new(store: Store) -> color_eyre::Result<Self> {
-        let cards: Vec<DraftCard> = store.drafts()?.iter().map(DraftCard::from).collect();
+        let cards: Vec<DraftCard> = store
+            .drafts()?
+            .into_iter()
+            .map(|stored| {
+                let mut card = DraftCard::from(&stored.draft);
+                card.source_dump = Some(stored.dump);
+                card.edited = stored.edited;
+                card
+            })
+            .collect();
         let mut app = Self::base(UiState::with_drafts(cards));
         app.store = Some(store);
 
@@ -60,6 +72,11 @@ impl App {
                 Event::App(app_event) => match app_event {
                     AppEvent::Quit => self.quit(),
                     AppEvent::DraftResult { id, result } => self.on_draft_result(id, result),
+                    AppEvent::RedraftResult {
+                        id,
+                        draft_id,
+                        result,
+                    } => self.on_redraft_result(id, draft_id, result),
                 },
             }
         }
@@ -79,9 +96,15 @@ impl App {
             return Ok(());
         }
 
+        if self.state.search_input {
+            self.handle_search_key(key_event);
+            return Ok(());
+        }
+
         match self.state.screen {
             Screen::Compose => self.handle_compose_key(key_event),
             Screen::Review => self.handle_review_key(key_event),
+            Screen::Edit => self.handle_edit_key(key_event),
             Screen::Settings => self.handle_settings_key(key_event),
             Screen::Home if self.state.focus == Focus::QuickNote => {
                 self.handle_quick_note_key(key_event);
@@ -118,11 +141,52 @@ impl App {
                 }
                 _ => {}
             },
-            Popup::SelectTone => {
-                if matches!(key_event.code, KeyCode::Esc | KeyCode::Enter) {
+            Popup::SelectTone => match key_event.code {
+                KeyCode::Esc => {
                     self.state.close_popup();
                 }
-            }
+                KeyCode::Enter => {
+                    let tone = Tone::ALL[self.state.tone_selection];
+                    self.state.close_popup();
+                    self.confirm_redraft(tone);
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.state.cycle_tone(1),
+                KeyCode::Up | KeyCode::Char('k') => self.state.cycle_tone(-1),
+                _ => {}
+            },
+            Popup::ConfirmRedraft => match key_event.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    self.state.close_popup();
+                    if let Some(tone) = self.state.pending_tone.take() {
+                        self.start_redrafting(tone);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') | KeyCode::Backspace => {
+                    self.state.pending_tone = None;
+                    self.state.close_popup();
+                }
+                _ => {}
+            },
+            Popup::DiscardEdit => match key_event.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    self.state.close_popup();
+                    self.state.leave_edit();
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') | KeyCode::Backspace => {
+                    self.state.close_popup();
+                }
+                _ => {}
+            },
+            Popup::ConfirmDelete => match key_event.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    self.state.close_popup();
+                    self.delete_selected();
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') | KeyCode::Backspace => {
+                    self.state.close_popup();
+                }
+                _ => {}
+            },
             Popup::DiscardDump => match key_event.code {
                 KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                     self.state.close_popup();
@@ -193,6 +257,15 @@ impl App {
         match key_event.code {
             KeyCode::Char('q') => self.state.open_popup(Popup::ConfirmQuit),
             KeyCode::Char('?') => self.state.open_popup(Popup::Help),
+            KeyCode::Char('/') => self.state.start_search(),
+            KeyCode::Char('e') if self.draft_actions_ready() => self.state.start_editing(),
+            KeyCode::Char('c') if self.draft_actions_ready() => self.copy_selected(),
+            KeyCode::Char('t') if self.draft_actions_ready() => self.state.begin_tone_select(),
+            KeyCode::Char('m') if self.draft_actions_ready() => self.toggle_complete(),
+            KeyCode::Char('z') if self.draft_actions_ready() => self.toggle_snooze(),
+            KeyCode::Char('d') if self.draft_actions_ready() => {
+                self.state.open_popup(Popup::ConfirmDelete);
+            }
             KeyCode::Char('n') if self.state.generation.is_generating() => {}
             KeyCode::Char('n') => self.state.start_compose(),
             KeyCode::Tab => self.state.focus_next(),
@@ -203,8 +276,256 @@ impl App {
             KeyCode::End => self.select_edge(true),
             KeyCode::Enter => self.activate_focused(),
             KeyCode::Esc if self.state.generation.is_generating() => self.cancel_drafting(),
+            KeyCode::Esc if !self.state.search_query.is_empty() => self.state.stop_search(),
             KeyCode::Esc => self.escape_focused(),
             _ => {}
+        }
+    }
+
+    fn draft_actions_ready(&self) -> bool {
+        matches!(self.state.focus, Focus::DraftList | Focus::Preview)
+            && !self.state.generation.is_generating()
+    }
+
+    fn handle_edit_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Esc => {
+                if self.state.edit_text_changed() {
+                    self.state.open_popup(Popup::DiscardEdit);
+                } else {
+                    self.state.leave_edit();
+                }
+            }
+            KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.save_edit();
+            }
+            _ => {
+                self.state.clear_error();
+                self.state.input_editor(key_event.into());
+            }
+        }
+    }
+
+    fn handle_search_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Esc => self.state.stop_search(),
+            KeyCode::Enter => self.state.close_search_input(),
+            KeyCode::Backspace => self.state.pop_search(),
+            KeyCode::Char(character)
+                if !key_event.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.state.push_search(character);
+            }
+            _ => {}
+        }
+    }
+
+    fn save_edit(&mut self) {
+        let Some(id) = self.state.editing_id.clone() else {
+            return;
+        };
+        let body = self.state.editor_text();
+
+        if let Some(store) = &self.store {
+            let result = Uuid::parse_str(&id)
+                .map_err(|_| format!("stored draft '{id}' has an invalid id"))
+                .and_then(|uuid| {
+                    store
+                        .update_draft_body(uuid, &body)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                self.state.set_error(error);
+                return;
+            }
+        }
+
+        self.state.apply_edit();
+    }
+
+    fn copy_selected(&mut self) {
+        let Some(card) = self.state.selected_draft() else {
+            return;
+        };
+        let body = card.body.clone();
+        self.report_copy(copy_to_clipboard(&body));
+    }
+
+    fn report_copy(&mut self, result: Result<(), arboard::Error>) {
+        match result {
+            Ok(()) => {
+                self.state.error = None;
+                self.state.notice = Some("Draft copied to the clipboard".to_string());
+            }
+            Err(error) => self.state.set_error(format!("Could not copy: {error}")),
+        }
+    }
+
+    fn toggle_complete(&mut self) {
+        let Some(card) = self.state.selected_draft() else {
+            return;
+        };
+        if card.status == DraftStatus::Completed {
+            self.set_status(DraftStatus::Draft, "Moved back to Drafts.");
+        } else {
+            self.set_status(
+                DraftStatus::Completed,
+                "Marked complete. The app never sends it for you.",
+            );
+        }
+    }
+
+    fn toggle_snooze(&mut self) {
+        let Some(card) = self.state.selected_draft() else {
+            return;
+        };
+        if card.status == DraftStatus::Snoozed {
+            self.set_status(DraftStatus::Review, "Draft moved to Inbox.");
+        } else {
+            self.set_status(DraftStatus::Snoozed, "Draft moved to Snoozed.");
+        }
+    }
+
+    fn set_status(&mut self, status: DraftStatus, notice: &str) {
+        let Some(card) = self.state.selected_draft() else {
+            return;
+        };
+        if card.status == status {
+            return;
+        }
+        let id = card.id.clone();
+
+        if let Some(store) = &self.store {
+            let result = Uuid::parse_str(&id)
+                .map_err(|_| format!("stored draft '{id}' has an invalid id"))
+                .and_then(|uuid| {
+                    store
+                        .update_draft_status(uuid, status)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                self.state.set_error(error);
+                return;
+            }
+        }
+
+        self.state.apply_status(status);
+        self.state.error = None;
+        self.state.notice = Some(notice.to_string());
+    }
+
+    fn delete_selected(&mut self) {
+        let Some(card) = self.state.selected_draft() else {
+            return;
+        };
+        let id = card.id.clone();
+
+        if let Some(store) = &self.store {
+            let result = Uuid::parse_str(&id)
+                .map_err(|_| format!("stored draft '{id}' has an invalid id"))
+                .and_then(|uuid| store.delete_draft(uuid).map_err(|error| error.to_string()));
+            if let Err(error) = result {
+                self.state.set_error(error);
+                return;
+            }
+        }
+
+        self.state.remove_selected_draft();
+        self.state.error = None;
+        self.state.notice = Some("Draft deleted".to_string());
+    }
+
+    fn confirm_redraft(&mut self, tone: Tone) {
+        let edited = self
+            .state
+            .selected_draft()
+            .map(|card| card.edited)
+            .unwrap_or(false);
+
+        if edited {
+            self.state.pending_tone = Some(tone);
+            self.state.open_popup(Popup::ConfirmRedraft);
+        } else {
+            self.start_redrafting(tone);
+        }
+    }
+
+    fn start_redrafting(&mut self, tone: Tone) {
+        if self.state.generation.is_generating() {
+            return;
+        }
+        let Some(card) = self.state.selected_draft() else {
+            return;
+        };
+        let Some(dump) = card.source_dump.clone() else {
+            self.state
+                .set_error("This draft has no original dump to regenerate from.");
+            return;
+        };
+        let draft_id = card.id.clone();
+        let body = card.body.clone();
+
+        let client = match OllamaClient::new(self.client_config.clone()) {
+            Ok(client) => client,
+            Err(error) => {
+                self.state.fail_generation(error.to_string());
+                return;
+            }
+        };
+
+        self.generation_id += 1;
+        let generation = self.generation_id;
+        self.state.begin_generation();
+        let sender = self.events.sender();
+        self.redrafting = Some(tokio::spawn(async move {
+            let result = client.redraft(&dump, &body, tone).await;
+            let _ = sender.send(Event::App(AppEvent::RedraftResult {
+                id: generation,
+                draft_id,
+                result,
+            }));
+        }));
+    }
+
+    fn on_redraft_result(&mut self, id: u64, draft_id: String, result: Result<Draft, OllamaError>) {
+        if id != self.generation_id {
+            return;
+        }
+        self.redrafting = None;
+
+        match result {
+            Ok(mut draft) => {
+                let recipient = self
+                    .state
+                    .drafts
+                    .iter()
+                    .find(|card| card.id == draft_id)
+                    .map(|card| card.recipient.clone());
+                let Some(recipient) = recipient else {
+                    return;
+                };
+                draft.recipient = recipient;
+
+                if let Some(store) = &self.store {
+                    let result = Uuid::parse_str(&draft_id)
+                        .map_err(|_| format!("stored draft '{draft_id}' has an invalid id"))
+                        .and_then(|uuid| {
+                            draft.id = uuid;
+                            store
+                                .update_draft(&draft)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = result {
+                        self.state.fail_generation(error.to_string());
+                        return;
+                    }
+                }
+
+                self.state.apply_redraft(&draft_id, draft);
+            }
+            Err(error) => self.state.fail_generation(error.to_string()),
         }
     }
 
@@ -346,6 +667,13 @@ fn is_review_shortcut(key_event: KeyEvent) -> bool {
             && matches!(key_event.code, KeyCode::Char('s' | 'S') | KeyCode::Enter))
 }
 
+fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.to_string())?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +720,7 @@ mod tests {
         app.client_config = OllamaConfig::resolve(
             Some("http://127.0.0.1:1".to_string()),
             Some("test-model".to_string()),
+            None,
         );
         start_drafting(&mut app);
         let id = app.generation_id;
@@ -402,10 +731,230 @@ mod tests {
 
         let stored = app.store.as_ref().unwrap().drafts().unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].title, "Cancel tonight");
-        assert_eq!(stored[0].status, crate::draft::DraftStatus::Review);
+        assert_eq!(stored[0].draft.title, "Cancel tonight");
+        assert_eq!(stored[0].draft.status, crate::draft::DraftStatus::Review);
         assert_eq!(app.state.drafts[0].title, "Cancel tonight");
         assert_eq!(app.state.notice.as_deref(), Some("1 draft saved"));
+    }
+
+    #[tokio::test]
+    async fn editing_saves_through_the_store_and_marks_the_draft() {
+        let mut app = stored_app();
+
+        app.handle_key_events(key(KeyCode::Char('e'))).unwrap();
+        assert_eq!(app.state.screen, Screen::Edit);
+
+        app.state.editor.insert_str(" Handwritten.");
+        app.handle_key_events(ctrl(KeyCode::Char('s'))).unwrap();
+
+        assert_eq!(app.state.screen, Screen::Home);
+        assert!(app.state.drafts[0].body.ends_with("Handwritten."));
+        assert!(app.state.drafts[0].edited);
+
+        let stored = app.store.as_ref().unwrap().drafts().unwrap();
+        assert!(stored[0].edited);
+        assert_eq!(stored[0].draft.body, app.state.drafts[0].body);
+        assert_eq!(app.state.notice.as_deref(), Some("Draft saved"));
+    }
+
+    #[tokio::test]
+    async fn esc_from_an_edited_draft_asks_before_discarding() {
+        let mut app = stored_app();
+
+        app.handle_key_events(key(KeyCode::Char('e'))).unwrap();
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.screen, Screen::Home);
+        assert_eq!(app.state.popup, None);
+
+        app.handle_key_events(key(KeyCode::Char('e'))).unwrap();
+        app.state.editor.insert_str(" typed");
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+
+        assert_eq!(app.state.popup, Some(Popup::DiscardEdit));
+        assert_eq!(app.state.screen, Screen::Edit);
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.state.screen, Screen::Home);
+        assert!(!app.state.drafts[0].body.ends_with(" typed"));
+        assert_eq!(app.state.editing_id, None);
+    }
+
+    #[tokio::test]
+    async fn status_changes_persist_through_the_store() {
+        let mut app = stored_app();
+
+        app.handle_key_events(key(KeyCode::Char('m'))).unwrap();
+
+        assert_eq!(app.state.drafts[0].status, DraftStatus::Completed);
+        assert_eq!(
+            app.store.as_ref().unwrap().drafts().unwrap()[0]
+                .draft
+                .status,
+            DraftStatus::Completed
+        );
+        assert_eq!(
+            app.state.notice.as_deref(),
+            Some("Marked complete. The app never sends it for you.")
+        );
+
+        app.state.section = Section::Completed;
+        app.state.sync_draft_selection();
+        app.handle_key_events(key(KeyCode::Char('m'))).unwrap();
+
+        assert_eq!(app.state.drafts[0].status, DraftStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn deleting_asks_before_removing_from_the_store() {
+        let mut app = stored_app();
+
+        app.handle_key_events(key(KeyCode::Char('d'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::ConfirmDelete));
+        assert_eq!(app.state.drafts.len(), 1);
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.state.drafts.len(), 0);
+        assert!(app.store.as_ref().unwrap().drafts().unwrap().is_empty());
+        assert_eq!(app.state.notice.as_deref(), Some("Draft deleted"));
+    }
+
+    #[tokio::test]
+    async fn a_tone_change_redrafts_one_draft_through_the_store() {
+        let mut app = stored_app();
+
+        app.handle_key_events(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::SelectTone));
+        assert_eq!(app.state.tone_selection, 0);
+
+        app.handle_key_events(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(app.state.tone_selection, 1);
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert!(app.state.generation.is_generating());
+
+        let id = app.generation_id;
+        let draft_id = app.state.drafts[0].id.clone();
+        let request =
+            DraftRequest::new("tell sam i cant make it tonight", Some(Tone::Warm)).unwrap();
+        let batch = crate::contract::parse_draft_response(&request, WARM_REPLY).unwrap();
+
+        app.on_redraft_result(id, draft_id, Ok(batch.drafts.into_iter().next().unwrap()));
+
+        assert_eq!(app.state.generation, GenerationState::Idle);
+        assert_eq!(app.state.drafts[0].tone, Tone::Warm);
+        assert_eq!(
+            app.state.drafts[0].recipient.as_deref(),
+            Some("Sam"),
+            "the recipient survives regeneration"
+        );
+        assert_eq!(
+            app.state.notice.as_deref(),
+            Some("Draft redrafted in a warm tone")
+        );
+
+        let stored = app.store.as_ref().unwrap().drafts().unwrap();
+        assert_eq!(stored[0].draft.tone, Tone::Warm);
+    }
+
+    #[tokio::test]
+    async fn an_edited_draft_asks_before_regenerating() {
+        let mut app = stored_app();
+
+        app.handle_key_events(key(KeyCode::Char('e'))).unwrap();
+        app.state.editor.insert_str(" typed");
+        app.handle_key_events(ctrl(KeyCode::Char('s'))).unwrap();
+        assert!(app.state.drafts[0].edited);
+
+        app.handle_key_events(key(KeyCode::Char('t'))).unwrap();
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::ConfirmRedraft));
+        assert!(!app.state.generation.is_generating());
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert!(app.state.generation.is_generating());
+    }
+
+    #[tokio::test]
+    async fn search_filters_and_navigates_results() {
+        let mut app = drafting_app();
+
+        app.handle_key_events(key(KeyCode::Char('/'))).unwrap();
+        assert!(app.state.search_input);
+
+        for character in "invoice".chars() {
+            app.handle_key_events(key(KeyCode::Char(character)))
+                .unwrap();
+        }
+        assert_eq!(app.state.search_query, "invoice");
+        assert_eq!(app.state.visible_draft_count(), 1);
+        assert_eq!(
+            app.state.selected_draft().map(|draft| draft.title.as_str()),
+            Some("Invoice follow-up")
+        );
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        assert!(!app.state.search_input);
+        app.handle_key_events(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(app.state.draft_list.selected(), Some(0));
+
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.state.search_query, "");
+        assert_eq!(app.state.visible_draft_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_copy_reports_a_useful_error() {
+        let mut app = drafting_app();
+
+        app.report_copy(Err(arboard::Error::Unknown {
+            description: "no clipboard provider".to_string(),
+        }));
+
+        assert!(
+            app.state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Could not copy")
+        );
+        assert!(app.state.notice.is_none());
+
+        app.report_copy(Ok(()));
+        assert_eq!(
+            app.state.notice.as_deref(),
+            Some("Draft copied to the clipboard")
+        );
+        assert!(app.state.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn quitting_works_while_an_operation_is_running() {
+        let mut app = drafting_app();
+        start_drafting(&mut app);
+        assert!(app.state.generation.is_generating());
+
+        app.handle_key_events(key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::ConfirmQuit));
+        assert!(app.running);
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+        match app.events.try_next_app().expect("quit event") {
+            AppEvent::Quit => app.quit(),
+            other => panic!("unexpected event {other:?}"),
+        }
+        assert!(!app.running);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn clipboard_round_trip_works_on_this_machine() {
+        let mut clipboard = arboard::Clipboard::new().expect("no clipboard provider");
+        clipboard
+            .set_text("blurp clipboard check".to_string())
+            .unwrap();
+        assert_eq!(clipboard.get_text().unwrap(), "blurp clipboard check");
     }
 
     #[tokio::test]
@@ -624,11 +1173,29 @@ mod tests {
 
     const CASUAL_REPLY: &str = r#"{"drafts":[{"id":"1","title":"Cancel tonight","recipient":"Sam","body":"Hey Sam, I can't make it tonight. Does Thursday work instead?","tone":"casual","missingDetails":[],"status":"review"}]}"#;
 
+    const WARM_REPLY: &str = r#"{"drafts":[{"id":"1","title":"Cancel tonight","recipient":"Sam","body":"Hey Sam, I can't make it tonight. Does Thursday work instead?","tone":"casual","missingDetails":[],"status":"draft"}]}"#;
+
     fn drafting_app() -> App {
         let mut app = App::demo();
         app.client_config = OllamaConfig::resolve(
             Some("http://127.0.0.1:1".to_string()),
             Some("test-model".to_string()),
+            None,
+        );
+        app
+    }
+
+    fn stored_app() -> App {
+        let store = Store::open_in_memory().unwrap();
+        let request = DraftRequest::new("tell sam i cant make it tonight", None).unwrap();
+        let batch = crate::contract::parse_draft_response(&request, CASUAL_REPLY).unwrap();
+        store.save_batch(&batch).unwrap();
+
+        let mut app = App::new(store).unwrap();
+        app.client_config = OllamaConfig::resolve(
+            Some("http://127.0.0.1:1".to_string()),
+            Some("test-model".to_string()),
+            None,
         );
         app
     }
@@ -791,7 +1358,8 @@ mod tests {
         .await;
 
         let mut app = App::demo();
-        app.client_config = OllamaConfig::resolve(Some(base_url), Some("test-model".to_string()));
+        app.client_config =
+            OllamaConfig::resolve(Some(base_url), Some("test-model".to_string()), None);
         start_drafting(&mut app);
         assert!(app.state.generation.is_generating());
 

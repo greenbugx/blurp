@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::draft::{DraftCard, DraftStatus};
+use crate::draft::{DraftCard, DraftStatus, Tone};
 use crate::state::{Focus, Popup, Screen, Section, UiState};
 use ratatui::{
     buffer::Buffer,
@@ -53,6 +53,7 @@ fn render_ui(state: &mut UiState, area: Rect, buf: &mut Buffer) {
         Screen::Home => render_home(state, area, buf),
         Screen::Compose => render_compose(state, area, buf),
         Screen::Review => render_review(state, area, buf),
+        Screen::Edit => render_edit(state, area, buf),
         Screen::Settings => render_settings(state, area, buf),
     }
 
@@ -65,7 +66,13 @@ fn render_ui(state: &mut UiState, area: Rect, buf: &mut Buffer) {
         } else {
             area
         };
-        render_popup(popup, state.sample_data, popup_bounds, buf);
+        render_popup(
+            popup,
+            state.sample_data,
+            state.tone_selection,
+            popup_bounds,
+            buf,
+        );
     }
 }
 
@@ -192,7 +199,9 @@ fn render_sidebar(state: &mut UiState, area: Rect, buf: &mut Buffer) {
 fn render_draft_list(state: &mut UiState, area: Rect, buf: &mut Buffer) {
     let focused = state.focus == Focus::DraftList;
     let count = state.visible_draft_count();
-    let title = if count > 0 {
+    let title = if !state.search_query.is_empty() {
+        format!("Search · {count}")
+    } else if count > 0 {
         format!("{} · {count}", state.section.label())
     } else {
         state.section.label().to_string()
@@ -202,7 +211,15 @@ fn render_draft_list(state: &mut UiState, area: Rect, buf: &mut Buffer) {
     block.render(area, buf);
 
     if count == 0 {
-        Paragraph::new(empty_list_message(state.section))
+        let message = if state.search_query.is_empty() {
+            empty_list_message(state.section).to_string()
+        } else {
+            format!(
+                "No drafts match \"{}\".\n\nEsc clears the search.",
+                state.search_query
+            )
+        };
+        Paragraph::new(message)
             .style(Style::default().fg(MUTED))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })
@@ -254,6 +271,20 @@ fn render_preview(state: &UiState, area: Rect, buf: &mut Buffer) {
         )));
     }
 
+    if let Some(dump) = &draft.source_dump {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "From your dump:",
+            Style::default().fg(MUTED),
+        )));
+        for dump_line in dump.lines() {
+            lines.push(Line::from(Span::styled(
+                dump_line.to_string(),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .render(inner, buf);
@@ -280,6 +311,26 @@ fn render_compose(state: &UiState, area: Rect, buf: &mut Buffer) {
     block.render(editor, buf);
 
     (&state.composer).render(inner, buf);
+    render_footer(state, footer, buf);
+}
+
+fn render_edit(state: &UiState, area: Rect, buf: &mut Buffer) {
+    if too_small(area) {
+        render_too_small(area, buf);
+        return;
+    }
+
+    let [editor, footer] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
+    let title = match state.editing_title() {
+        Some(title) => format!("Edit · {title}"),
+        None => "Edit draft".to_string(),
+    };
+    let block = pane_block(title, true);
+    let inner = block.inner(editor);
+    block.render(editor, buf);
+
+    (&state.editor).render(inner, buf);
     render_footer(state, footer, buf);
 }
 
@@ -380,8 +431,11 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
         return match popup {
             Popup::Help => &[("Esc", "close"), ("q", "quit")],
             Popup::ConfirmQuit => &[("Enter", "quit"), ("Esc", "cancel")],
-            Popup::SelectTone => &[("Esc", "close")],
+            Popup::SelectTone => &[("j/k", "choose"), ("Enter", "apply"), ("Esc", "close")],
             Popup::DiscardDump => &[("Enter", "discard"), ("Esc", "keep")],
+            Popup::DiscardEdit => &[("Enter", "discard"), ("Esc", "keep editing")],
+            Popup::ConfirmDelete => &[("Enter", "delete"), ("Esc", "keep")],
+            Popup::ConfirmRedraft => &[("Enter", "regenerate"), ("Esc", "keep edits")],
         };
     }
 
@@ -409,6 +463,7 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
             ("Esc", "workspace"),
             ("?", "help"),
         ],
+        Screen::Edit => &[("type", "freely"), ("Ctrl+S", "save"), ("Esc", "cancel")],
         Screen::Settings => &[("Esc", "back"), ("?", "help"), ("q", "quit")],
         Screen::Home => match state.focus {
             Focus::Sidebar => &[
@@ -416,12 +471,16 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
                 ("Enter", "open"),
                 ("Tab", "pane"),
                 ("n", "new"),
+                ("/", "search"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
             Focus::DraftList => &[
                 ("j/k", "move"),
                 ("Enter", "open"),
+                ("e", "edit"),
+                ("c", "copy"),
+                ("m", "done"),
                 ("Tab", "pane"),
                 ("n", "new"),
                 ("?", "help"),
@@ -429,8 +488,12 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
             ],
             Focus::Preview => &[
                 ("Esc", "back"),
-                ("Tab", "pane"),
-                ("n", "new"),
+                ("e", "edit"),
+                ("c", "copy"),
+                ("t", "tone"),
+                ("m", "done"),
+                ("z", "snooze"),
+                ("d", "delete"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -444,8 +507,11 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
         return match popup {
             Popup::Help => &[("Esc", "close"), ("q", "quit")],
             Popup::ConfirmQuit => &[("Enter", "quit"), ("Esc", "cancel")],
-            Popup::SelectTone => &[("Esc", "close")],
+            Popup::SelectTone => &[("j/k", "choose"), ("Enter", "apply"), ("Esc", "close")],
             Popup::DiscardDump => &[("Enter", "discard"), ("Esc", "keep")],
+            Popup::DiscardEdit => &[("Enter", "discard"), ("Esc", "keep")],
+            Popup::ConfirmDelete => &[("Enter", "delete"), ("Esc", "keep")],
+            Popup::ConfirmRedraft => &[("Enter", "replace"), ("Esc", "keep")],
         };
     }
 
@@ -461,6 +527,7 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
             ("x", "discard"),
             ("Esc", "back"),
         ],
+        Screen::Edit => &[("Ctrl+S", "save"), ("Esc", "cancel")],
         Screen::Settings => &[("Esc", "back"), ("q", "quit")],
         Screen::Home => match state.focus {
             Focus::Sidebar => &[
@@ -471,15 +538,18 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
             ],
             Focus::DraftList => &[
                 ("Enter", "open"),
+                ("e", "edit"),
+                ("c", "copy"),
                 ("Tab", "pane"),
-                ("n", "new"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
             Focus::Preview => &[
                 ("Esc", "back"),
-                ("Tab", "pane"),
-                ("n", "new"),
+                ("e", "edit"),
+                ("c", "copy"),
+                ("t", "tone"),
+                ("m", "done"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -501,6 +571,17 @@ fn footer_status(state: &UiState, width: u16) -> Line<'static> {
             " Generating with Ollama... Esc to cancel",
             Style::default().fg(ACCENT),
         ));
+    }
+
+    if state.search_input || !state.search_query.is_empty() {
+        let cursor = if state.search_input { "▏" } else { "" };
+        return Line::from(vec![
+            Span::styled(" / ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("{}{cursor}", state.search_query),
+                Style::default().fg(TEXT),
+            ),
+        ]);
     }
 
     if let Some(notice) = &state.notice {
@@ -542,12 +623,21 @@ fn footer_status(state: &UiState, width: u16) -> Line<'static> {
     ])
 }
 
-fn render_popup(popup: Popup, sample_data: bool, area: Rect, buf: &mut Buffer) {
+fn render_popup(
+    popup: Popup,
+    sample_data: bool,
+    tone_selection: usize,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let (max_width, max_height) = match popup {
-        Popup::Help => (58, 12),
+        Popup::Help => (58, 22),
         Popup::ConfirmQuit => (58, 9),
-        Popup::SelectTone => (58, 7),
+        Popup::SelectTone => (58, 10),
         Popup::DiscardDump => (58, 9),
+        Popup::DiscardEdit => (58, 9),
+        Popup::ConfirmDelete => (58, 10),
+        Popup::ConfirmRedraft => (58, 10),
     };
     let popup_area = centered_rect(area, max_width, max_height);
     if popup_area.width < 20 || popup_area.height < 5 {
@@ -577,10 +667,33 @@ fn render_popup(popup: Popup, sample_data: bool, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(popup_area);
     block.render(popup_area, buf);
 
+    if popup == Popup::SelectTone {
+        render_tone_list(tone_selection, inner, buf);
+        return;
+    }
+
     Paragraph::new(format!("\n{}\n", popup.body(sample_data)))
         .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: false })
         .render(inner, buf);
+}
+
+fn render_tone_list(selected: usize, area: Rect, buf: &mut Buffer) {
+    let lines = Tone::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, tone)| {
+            let style = if index == selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            let marker = if index == selected { "> " } else { "  " };
+            Line::from(Span::styled(format!("{marker}{}", tone.label()), style))
+        })
+        .collect::<Vec<_>>();
+
+    Paragraph::new(lines).render(area, buf);
 }
 
 fn render_too_small(area: Rect, buf: &mut Buffer) {
@@ -765,6 +878,7 @@ mod tests {
             Screen::Home,
             Screen::Compose,
             Screen::Review,
+            Screen::Edit,
             Screen::Settings,
         ];
         let popups = [
@@ -773,6 +887,9 @@ mod tests {
             Some(Popup::ConfirmQuit),
             Some(Popup::SelectTone),
             Some(Popup::DiscardDump),
+            Some(Popup::DiscardEdit),
+            Some(Popup::ConfirmDelete),
+            Some(Popup::ConfirmRedraft),
         ];
 
         for (width, height) in sizes {
@@ -788,6 +905,20 @@ mod tests {
                     let mut buf = Buffer::empty(area);
                     render_ui(&mut state, area, &mut buf);
                 }
+            }
+        }
+
+        for (width, height) in sizes {
+            for search_input in [false, true] {
+                let mut state = UiState {
+                    search_input,
+                    ..UiState::demo()
+                };
+                state.search_query = "invoice".to_string();
+
+                let area = Rect::new(0, 0, width, height);
+                let mut buf = Buffer::empty(area);
+                render_ui(&mut state, area, &mut buf);
             }
         }
     }
@@ -840,6 +971,17 @@ mod tests {
     }
 
     #[test]
+    fn search_results_replace_the_section_title() {
+        let mut state = UiState::demo();
+        state.search_query = "invoice".to_string();
+
+        let text = render_text(&mut state, Rect::new(0, 0, 100, 30));
+
+        assert!(text.contains("Search · 1"));
+        assert!(!text.contains("Inbox · 3"));
+    }
+
+    #[test]
     fn the_footer_distinguishes_empty_and_persisted_workspaces() {
         let mut state = UiState::default();
 
@@ -853,6 +995,8 @@ mod tests {
             tone: crate::draft::Tone::Casual,
             status: DraftStatus::Review,
             body: String::new(),
+            source_dump: None,
+            edited: false,
         });
 
         let loaded = line_text(footer_status(&state, 120));
@@ -870,7 +1014,7 @@ mod tests {
         let mut empty = UiState::default();
         empty.open_popup(Popup::ConfirmQuit);
         let empty_text = render_text(&mut empty, Rect::new(0, 0, 80, 18));
-        assert!(empty_text.contains("Nothing is saved between launches yet."));
+        assert!(empty_text.contains("Drafts persist on this machine."));
         assert!(!empty_text.contains("Sample drafts reset"));
     }
 

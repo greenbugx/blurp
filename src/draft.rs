@@ -78,6 +78,8 @@ pub struct DraftCard {
     pub tone: Tone,
     pub status: DraftStatus,
     pub body: String,
+    pub source_dump: Option<String>,
+    pub edited: bool,
 }
 
 impl From<&Draft> for DraftCard {
@@ -89,6 +91,8 @@ impl From<&Draft> for DraftCard {
             tone: draft.tone,
             status: draft.status,
             body: draft.body.clone(),
+            source_dump: None,
+            edited: false,
         }
     }
 }
@@ -171,6 +175,8 @@ fn draft(
         tone,
         status,
         body: body.to_string(),
+        source_dump: None,
+        edited: false,
     }
 }
 

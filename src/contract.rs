@@ -61,6 +61,34 @@ Rules:
 - If the user message begins with a "Requested tone:" line, use that tone for every draft.
 - Output the JSON object and nothing else. No explanations and no code fences."#;
 
+pub const REGENERATE_PROMPT: &str = r#"You rewrite one existing message draft in a requested tone.
+
+The user message contains the original brain dump, the current draft, and the requested tone. Reply with JSON only, in exactly this shape:
+
+{
+  "drafts": [
+    {
+      "id": "1",
+      "title": "Plans tonight",
+      "recipient": "Sam",
+      "body": "Hey Sam, I can't make it tonight. Does Thursday work instead?",
+      "tone": "casual",
+      "missingDetails": [],
+      "status": "draft"
+    }
+  ]
+}
+
+Rules:
+- Return exactly one draft.
+- Keep the same recipient and the same intention as the current draft.
+- Set tone to the requested tone, always.
+- Use only facts from the brain dump and the current draft. Never invent recipients, dates, times, amounts, promises, reasons, events, or personal history.
+- When a needed fact is missing, leave it out of the body and list it in missingDetails instead of guessing.
+- status: "review" when missingDetails is not empty, otherwise "draft". Never any other value.
+- Keep the body as short as the situation allows, with no filler phrases.
+- Output the JSON object and nothing else. No explanations and no code fences."#;
+
 /// A brain dump submitted for drafting.
 ///
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +114,15 @@ impl DraftRequest {
             None => self.dump.clone(),
         }
     }
+}
+
+pub fn regenerate_message(dump: &str, body: &str, tone: Tone) -> String {
+    format!(
+        "Original brain dump:\n{}\n\nCurrent draft:\n{}\n\nRequested tone: {}",
+        dump,
+        body,
+        tone.label()
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -474,6 +511,37 @@ Hope this helps!"#;
 
         let toned = DraftRequest::new("hello there", Some(Tone::Firm)).unwrap();
         assert_eq!(toned.user_message(), "Requested tone: firm\n\nhello there");
+    }
+
+    #[test]
+    fn the_regenerate_prompt_matches_the_contract() {
+        for field in [
+            "id",
+            "title",
+            "recipient",
+            "body",
+            "tone",
+            "missingDetails",
+            "status",
+        ] {
+            assert!(REGENERATE_PROMPT.contains(field), "missing field {field}");
+        }
+        assert!(REGENERATE_PROMPT.contains("exactly one draft"));
+        assert!(REGENERATE_PROMPT.contains("\"review\""));
+        assert!(REGENERATE_PROMPT.contains("\"draft\""));
+
+        let request = request("contract check");
+        let batch = parse_draft_response(&request, REGENERATE_PROMPT).unwrap();
+        assert_eq!(batch.drafts.len(), 1);
+    }
+
+    #[test]
+    fn regenerate_messages_carry_the_dump_body_and_tone() {
+        let message = regenerate_message("tell sam i cant make it", "Hey Sam.", Tone::Firm);
+
+        assert!(message.contains("tell sam i cant make it"));
+        assert!(message.contains("Hey Sam."));
+        assert!(message.ends_with("Requested tone: firm"));
     }
 
     #[test]

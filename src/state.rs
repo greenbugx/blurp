@@ -1,4 +1,5 @@
-use crate::draft::{DraftCard, DraftStatus, sample_drafts};
+use crate::contract::Draft;
+use crate::draft::{DraftCard, DraftStatus, Tone, sample_drafts};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{Input, TextArea};
@@ -9,6 +10,7 @@ pub enum Screen {
     Home,
     Compose,
     Review,
+    Edit,
     Settings,
 }
 
@@ -54,6 +56,9 @@ pub enum Popup {
     ConfirmQuit,
     SelectTone,
     DiscardDump,
+    DiscardEdit,
+    ConfirmDelete,
+    ConfirmRedraft,
 }
 
 impl Popup {
@@ -63,6 +68,9 @@ impl Popup {
             Self::ConfirmQuit => "Quit blurp?",
             Self::SelectTone => "Select tone",
             Self::DiscardDump => "Discard dump?",
+            Self::DiscardEdit => "Discard changes?",
+            Self::ConfirmDelete => "Delete this draft?",
+            Self::ConfirmRedraft => "Replace your edits?",
         }
     }
 
@@ -74,6 +82,13 @@ impl Popup {
                  j / k, up / down  move selection\n\
                  Home / End        first / last item\n\
                  Enter             open / select\n\
+                 e                 edit draft\n\
+                 c                 copy draft\n\
+                 t                 change tone\n\
+                 m                 mark done / undo\n\
+                 z                 snooze / wake\n\
+                 d                 delete draft\n\
+                 /                 search drafts\n\
                  Esc               back\n\
                  ?                 this help\n\
                  q                 quit"
@@ -84,18 +99,32 @@ impl Popup {
                      Anything half-typed is left behind.\n\n\
                      Enter or y to quit. Esc or n to keep going."
                 } else {
-                    "Nothing is saved between launches yet.\n\
+                    "Drafts persist on this machine.\n\
                      Anything half-typed is left behind.\n\n\
                      Enter or y to quit. Esc or n to keep going."
                 }
             }
             Self::SelectTone => {
-                "Per-draft tone changes arrive with regeneration.\n\n\
-                 Esc to close."
+                "The draft is regenerated locally.\n\n\
+                 j / k to choose. Enter to apply. Esc to close."
             }
             Self::DiscardDump => {
                 "This clears the text in the composer.\n\n\
                  Enter or y to discard. Esc or n to keep it."
+            }
+            Self::DiscardEdit => {
+                "The edited text is not saved.\n\n\
+                 Enter or y to discard. Esc or n to keep editing."
+            }
+            Self::ConfirmDelete => {
+                "This removes the draft from local storage.\n\
+                 The app never sends messages for you.\n\n\
+                 Enter or y to delete. Esc or n to keep it."
+            }
+            Self::ConfirmRedraft => {
+                "This draft was edited by hand.\n\
+                 Regenerating replaces the saved version.\n\n\
+                 Enter or y to regenerate. Esc or n to keep your edits."
             }
         }
     }
@@ -177,6 +206,13 @@ pub struct UiState {
     pub quick_note: TextArea<'static>,
     pub review_scroll: u16,
 
+    pub editor: TextArea<'static>,
+    pub editing_id: Option<String>,
+    pub tone_selection: usize,
+    pub pending_tone: Option<Tone>,
+    pub search_input: bool,
+    pub search_query: String,
+
     pub generation: GenerationState,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -199,6 +235,12 @@ impl Default for UiState {
             composer: composer_editor(),
             quick_note: quick_note_editor(),
             review_scroll: 0,
+            editor: TextArea::default(),
+            editing_id: None,
+            tone_selection: 0,
+            pending_tone: None,
+            search_input: false,
+            search_query: String::new(),
             generation: GenerationState::Idle,
             error: None,
             notice: None,
@@ -319,7 +361,27 @@ impl UiState {
     pub fn visible_drafts(&self) -> impl Iterator<Item = &DraftCard> {
         self.drafts
             .iter()
-            .filter(|draft| self.section.accepts(draft.status))
+            .filter(|draft| self.matches_filter(draft))
+    }
+
+    fn matches_filter(&self, draft: &DraftCard) -> bool {
+        if self.search_query.is_empty() {
+            return self.section.accepts(draft.status);
+        }
+
+        let query = self.search_query.to_lowercase();
+        if draft.title.to_lowercase().contains(&query) {
+            return true;
+        }
+        if draft.body.to_lowercase().contains(&query) {
+            return true;
+        }
+
+        draft
+            .recipient
+            .as_deref()
+            .map(|recipient| recipient.to_lowercase().contains(&query))
+            .unwrap_or(false)
     }
 
     pub fn visible_draft_count(&self) -> usize {
@@ -469,6 +531,152 @@ impl UiState {
         self.generation = GenerationState::Idle;
         self.error = None;
         self.notice = Some("Drafting cancelled. Dump kept.".to_string());
+    }
+
+    pub fn begin_tone_select(&mut self) {
+        let Some(card) = self.selected_draft() else {
+            return;
+        };
+        self.tone_selection = Tone::ALL
+            .iter()
+            .position(|tone| *tone == card.tone)
+            .unwrap_or(0);
+        self.popup = Some(Popup::SelectTone);
+    }
+
+    pub fn cycle_tone(&mut self, delta: isize) {
+        let count = Tone::ALL.len();
+        let next = (self.tone_selection as isize + delta).rem_euclid(count as isize) as usize;
+        self.tone_selection = next;
+    }
+
+    pub fn apply_redraft(&mut self, id: &str, draft: Draft) {
+        let tone = draft.tone;
+        if let Some(card) = self.drafts.iter_mut().find(|card| card.id == id) {
+            card.title = draft.title;
+            card.body = draft.body;
+            card.tone = draft.tone;
+            card.status = draft.status;
+            card.edited = false;
+        }
+        self.generation = GenerationState::Idle;
+        self.error = None;
+        self.notice = Some(format!("Draft redrafted in a {} tone", tone.label()));
+    }
+
+    pub fn start_editing(&mut self) {
+        let Some(card) = self.selected_draft().cloned() else {
+            return;
+        };
+        let mut editor = TextArea::default();
+        editor.insert_str(card.body.clone());
+        self.editor = editor;
+        self.editing_id = Some(card.id);
+        self.popup = None;
+        self.error = None;
+        self.notice = None;
+        self.screen = Screen::Edit;
+    }
+
+    pub fn editor_text(&self) -> String {
+        self.editor.lines().join("\n")
+    }
+
+    pub fn input_editor(&mut self, input: Input) {
+        self.editor.input(input);
+    }
+
+    pub fn edit_text_changed(&self) -> bool {
+        match self
+            .editing_id
+            .as_deref()
+            .and_then(|id| self.drafts.iter().find(|card| card.id == id))
+        {
+            Some(card) => self.editor_text() != card.body,
+            None => false,
+        }
+    }
+
+    pub fn editing_title(&self) -> Option<String> {
+        let id = self.editing_id.as_deref()?;
+        Some(self.drafts.iter().find(|card| card.id == id)?.title.clone())
+    }
+
+    pub fn apply_edit(&mut self) {
+        let Some(id) = self.editing_id.clone() else {
+            return;
+        };
+        let body = self.editor_text();
+        if let Some(card) = self.drafts.iter_mut().find(|card| card.id == id) {
+            card.body = body;
+            card.edited = true;
+        }
+        self.leave_edit();
+        self.notice = Some("Draft saved".to_string());
+    }
+
+    pub fn leave_edit(&mut self) {
+        self.editing_id = None;
+        self.popup = None;
+        self.screen = Screen::Home;
+        self.focus = Focus::Preview;
+    }
+
+    pub fn apply_status(&mut self, status: DraftStatus) {
+        let index = self.draft_list.selected();
+        if let Some(card) = self.selected_draft_mut() {
+            card.status = status;
+        }
+        let count = self.visible_draft_count();
+        let next = index.and_then(|index| (count > 0).then(|| index.min(count - 1)));
+        self.draft_list.select(next);
+    }
+
+    pub fn remove_selected_draft(&mut self) {
+        let Some(index) = self.draft_list.selected() else {
+            return;
+        };
+        let Some(card) = self.draft_at(index) else {
+            return;
+        };
+        let id = card.id.clone();
+        self.drafts.retain(|draft| draft.id != id);
+
+        let count = self.visible_draft_count();
+        let next = (count > 0).then(|| index.min(count - 1));
+        self.draft_list.select(next);
+    }
+
+    fn selected_draft_mut(&mut self) -> Option<&mut DraftCard> {
+        let index = self.draft_list.selected()?;
+        let id = self.draft_at(index)?.id.clone();
+        self.drafts.iter_mut().find(|draft| draft.id == id)
+    }
+
+    pub fn start_search(&mut self) {
+        self.search_input = true;
+        self.error = None;
+        self.notice = None;
+    }
+
+    pub fn close_search_input(&mut self) {
+        self.search_input = false;
+    }
+
+    pub fn stop_search(&mut self) {
+        self.search_input = false;
+        self.search_query.clear();
+        self.sync_draft_selection();
+    }
+
+    pub fn push_search(&mut self, character: char) {
+        self.search_query.push(character);
+        self.sync_draft_selection();
+    }
+
+    pub fn pop_search(&mut self) {
+        self.search_query.pop();
+        self.sync_draft_selection();
     }
 
     pub fn discard_compose(&mut self) {
@@ -930,6 +1138,115 @@ mod tests {
         assert_eq!(state.selected_draft().unwrap().title, "Only");
     }
 
+    #[test]
+    fn editing_round_trips_through_the_editor() {
+        let mut state = UiState::demo();
+
+        state.start_editing();
+        assert_eq!(state.screen, Screen::Edit);
+        assert_eq!(state.editing_id.as_deref(), Some("1"));
+        assert_eq!(
+            state.editing_title().as_deref(),
+            Some("Running late tonight")
+        );
+        assert_eq!(state.editor_text(), state.drafts[0].body);
+        assert!(!state.edit_text_changed());
+
+        state.editor.insert_str("extra");
+        assert!(state.edit_text_changed());
+
+        state.apply_edit();
+        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(state.focus, Focus::Preview);
+        assert_eq!(state.editing_id, None);
+        assert!(state.drafts[0].edited);
+        assert!(state.drafts[0].body.ends_with("extra"));
+        assert_eq!(state.notice.as_deref(), Some("Draft saved"));
+    }
+
+    #[test]
+    fn search_filters_across_sections_and_resets_cleanly() {
+        let mut state = UiState::demo();
+        assert_eq!(state.visible_draft_count(), 3);
+
+        state.start_search();
+        state.push_search('i');
+        state.push_search('n');
+        state.push_search('v');
+        assert!(state.search_input);
+
+        let titles = state
+            .visible_drafts()
+            .map(|draft| draft.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["Invoice follow-up"]);
+        assert_eq!(state.draft_list.selected(), Some(0));
+
+        state.close_search_input();
+        assert!(!state.search_input);
+        assert_eq!(state.visible_draft_count(), 1);
+
+        state.stop_search();
+        assert_eq!(state.search_query, "");
+        assert_eq!(state.visible_draft_count(), 3);
+    }
+
+    #[test]
+    fn status_updates_move_drafts_between_sections() {
+        let mut state = UiState::demo();
+
+        state.apply_status(DraftStatus::Completed);
+
+        assert_eq!(state.drafts[0].status, DraftStatus::Completed);
+        assert_eq!(state.visible_draft_count(), 2);
+        assert_eq!(state.selected_draft().unwrap().status, DraftStatus::Review);
+    }
+
+    #[test]
+    fn redraft_updates_one_card_in_place() {
+        let mut state = UiState::demo();
+        state.start_editing();
+        state.apply_edit();
+        assert!(state.drafts[0].edited);
+
+        let draft = Draft {
+            id: uuid::Uuid::new_v4(),
+            title: "Firmer goodbye".to_string(),
+            recipient: Some("Anya".to_string()),
+            body: "Anya, I cannot make it tonight.".to_string(),
+            tone: Tone::Firm,
+            status: DraftStatus::Draft,
+            missing_details: Vec::new(),
+        };
+
+        state.apply_redraft("1", draft);
+
+        assert_eq!(state.drafts[0].title, "Firmer goodbye");
+        assert_eq!(state.drafts[0].tone, Tone::Firm);
+        assert!(!state.drafts[0].edited);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Draft redrafted in a firm tone")
+        );
+        assert_eq!(state.generation, GenerationState::Idle);
+    }
+
+    #[test]
+    fn removing_the_selected_draft_keeps_a_neighbour_selected() {
+        let mut state = UiState::demo();
+        state.select_next_draft(state.visible_draft_count());
+        assert_eq!(state.selected_draft().unwrap().title, "Invoice follow-up");
+
+        state.remove_selected_draft();
+
+        assert_eq!(state.visible_draft_count(), 2);
+        assert_eq!(
+            state.selected_draft().unwrap().title,
+            "Monday submission",
+            "the next draft takes the vacated slot"
+        );
+    }
+
     fn card(title: &str) -> DraftCard {
         DraftCard {
             id: title.to_lowercase().replace(' ', "-"),
@@ -938,6 +1255,8 @@ mod tests {
             tone: crate::draft::Tone::Casual,
             status: DraftStatus::Review,
             body: "body".to_string(),
+            source_dump: None,
+            edited: false,
         }
     }
 
