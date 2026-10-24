@@ -66,13 +66,7 @@ fn render_ui(state: &mut UiState, area: Rect, buf: &mut Buffer) {
         } else {
             area
         };
-        render_popup(
-            popup,
-            state.sample_data,
-            state.tone_selection,
-            popup_bounds,
-            buf,
-        );
+        render_popup(popup, state, popup_bounds, buf);
     }
 }
 
@@ -497,6 +491,12 @@ fn full_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] {
             Popup::DiscardEdit => &[("Enter", "discard"), ("Esc", "keep editing")],
             Popup::ConfirmDelete => &[("Enter", "delete"), ("Esc", "keep")],
             Popup::ConfirmRedraft => &[("Enter", "regenerate"), ("Esc", "keep edits")],
+            Popup::CommandPalette => &[
+                ("type", "filter"),
+                ("Arrows", "choose"),
+                ("Enter", "run"),
+                ("Esc", "close"),
+            ],
         };
     }
 
@@ -585,6 +585,7 @@ fn narrow_shortcuts(state: &UiState) -> &'static [(&'static str, &'static str)] 
             Popup::DiscardEdit => &[("Enter", "discard"), ("Esc", "keep")],
             Popup::ConfirmDelete => &[("Enter", "delete"), ("Esc", "keep")],
             Popup::ConfirmRedraft => &[("Enter", "replace"), ("Esc", "keep")],
+            Popup::CommandPalette => &[("Arrows", "choose"), ("Enter", "run"), ("Esc", "close")],
         };
     }
 
@@ -701,13 +702,7 @@ fn footer_status(state: &UiState, width: u16) -> Line<'static> {
     ])
 }
 
-fn render_popup(
-    popup: Popup,
-    sample_data: bool,
-    tone_selection: usize,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+fn render_popup(popup: Popup, state: &UiState, area: Rect, buf: &mut Buffer) {
     let (max_width, max_height) = match popup {
         Popup::Help => (58, 22),
         Popup::ConfirmQuit => (58, 9),
@@ -716,6 +711,7 @@ fn render_popup(
         Popup::DiscardEdit => (58, 9),
         Popup::ConfirmDelete => (58, 10),
         Popup::ConfirmRedraft => (58, 10),
+        Popup::CommandPalette => (58, 17),
     };
     let popup_area = centered_rect(area, max_width, max_height);
     if popup_area.width < 20 || popup_area.height < 5 {
@@ -746,14 +742,64 @@ fn render_popup(
     block.render(popup_area, buf);
 
     if popup == Popup::SelectTone {
-        render_tone_list(tone_selection, inner, buf);
+        render_tone_list(state.tone_selection, inner, buf);
         return;
     }
 
-    Paragraph::new(format!("\n{}\n", popup.body(sample_data)))
+    if popup == Popup::CommandPalette {
+        render_command_palette(state, inner, buf);
+        return;
+    }
+
+    Paragraph::new(format!("\n{}\n", popup.body(state.sample_data)))
         .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: false })
         .render(inner, buf);
+}
+
+fn render_command_palette(state: &UiState, area: Rect, buf: &mut Buffer) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("{}▏", state.palette_query),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let commands = state.palette_commands();
+    if commands.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("No commands match \"{}\".", state.palette_query),
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for (index, command) in commands.iter().enumerate() {
+            let selected = index == state.palette_selection;
+            let marker = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker}{}", command.label()),
+                style,
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Type to filter. Arrows choose. Enter runs. Esc closes.",
+        Style::default().fg(MUTED),
+    )));
+
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(area, buf);
 }
 
 fn render_tone_list(selected: usize, area: Rect, buf: &mut Buffer) {

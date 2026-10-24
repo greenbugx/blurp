@@ -3,7 +3,7 @@ use crate::db::Store;
 use crate::draft::{DraftCard, DraftStatus, Tone};
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::ollama::{MODEL_ENV, OllamaClient, OllamaConfig, OllamaError};
-use crate::state::{Focus, Popup, Screen, Section, UiState};
+use crate::state::{Command, Focus, Popup, Screen, Section, UiState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 use tokio::task::JoinHandle;
@@ -107,6 +107,13 @@ impl App {
             return Ok(false);
         }
 
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key_event.code, KeyCode::Char('p' | 'P'))
+        {
+            self.state.open_palette();
+            return Ok(false);
+        }
+
         if self.state.search_input {
             self.handle_search_key(key_event);
             return Ok(false);
@@ -198,6 +205,29 @@ impl App {
                 }
                 _ => {}
             },
+            Popup::CommandPalette => match key_event.code {
+                KeyCode::Esc => {
+                    self.state.close_popup();
+                }
+                KeyCode::Enter => {
+                    let Some(command) = self.state.selected_command() else {
+                        return;
+                    };
+                    self.state.close_popup();
+                    self.run_command(command);
+                }
+                KeyCode::Down => self.state.select_next_command(),
+                KeyCode::Up => self.state.select_previous_command(),
+                KeyCode::Backspace => self.state.pop_palette(),
+                KeyCode::Char(character)
+                    if !key_event.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.state.push_palette(character);
+                }
+                _ => {}
+            },
             Popup::DiscardDump => match key_event.code {
                 KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                     self.state.close_popup();
@@ -240,6 +270,30 @@ impl App {
             KeyCode::PageUp => self.state.scroll_review(-5),
             KeyCode::Home => self.state.review_to_start(),
             KeyCode::End => self.state.review_to_end(),
+            _ => {}
+        }
+    }
+
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::NewBrainDump if self.state.generation.is_generating() => {}
+            Command::NewBrainDump => self.state.start_compose(),
+            Command::EditDraft if self.draft_actions_ready() => self.state.start_editing(),
+            Command::CopyDraft if self.draft_actions_ready() => self.copy_selected(),
+            Command::ChangeTone if self.draft_actions_ready() => self.state.begin_tone_select(),
+            Command::MarkComplete if self.draft_actions_ready() => self.toggle_complete(),
+            Command::SnoozeDraft if self.draft_actions_ready() => self.toggle_snooze(),
+            Command::DeleteDraft if self.draft_actions_ready() => {
+                self.state.open_popup(Popup::ConfirmDelete);
+            }
+            Command::SearchDrafts => self.state.start_search(),
+            Command::OpenSettings => {
+                let model = self.client_config.model.clone();
+                self.state.open_settings(model);
+                self.fetch_models();
+            }
+            Command::ShowHelp => self.state.open_popup(Popup::Help),
+            Command::Quit => self.state.open_popup(Popup::ConfirmQuit),
             _ => {}
         }
     }
@@ -1166,6 +1220,48 @@ mod tests {
             other => panic!("unexpected event {other:?}"),
         }
         assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn ctrl_p_opens_the_palette_and_enter_runs_the_selected_command() {
+        let mut app = drafting_app();
+
+        app.handle_key_events(ctrl(KeyCode::Char('p'))).unwrap();
+        assert_eq!(app.state.popup, Some(Popup::CommandPalette));
+        assert_eq!(app.state.palette_query, "");
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.state.popup, None);
+        assert_eq!(app.state.screen, Screen::Compose);
+    }
+
+    #[tokio::test]
+    async fn the_palette_filters_and_runs_the_matching_command() {
+        let mut app = drafting_app();
+
+        app.handle_key_events(ctrl(KeyCode::Char('p'))).unwrap();
+        for character in "quit".chars() {
+            app.handle_key_events(key(KeyCode::Char(character)))
+                .unwrap();
+        }
+        assert_eq!(app.state.palette_commands().len(), 1);
+
+        app.handle_key_events(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.state.popup, Some(Popup::ConfirmQuit));
+        assert!(app.running);
+    }
+
+    #[tokio::test]
+    async fn the_palette_closes_without_running_on_escape() {
+        let mut app = drafting_app();
+
+        app.handle_key_events(ctrl(KeyCode::Char('p'))).unwrap();
+        app.handle_key_events(key(KeyCode::Esc)).unwrap();
+
+        assert_eq!(app.state.popup, None);
+        assert_eq!(app.state.screen, Screen::Home);
     }
 
     #[test]

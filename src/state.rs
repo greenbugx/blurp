@@ -59,6 +59,54 @@ pub enum Popup {
     DiscardEdit,
     ConfirmDelete,
     ConfirmRedraft,
+    CommandPalette,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command {
+    NewBrainDump,
+    EditDraft,
+    CopyDraft,
+    ChangeTone,
+    MarkComplete,
+    SnoozeDraft,
+    DeleteDraft,
+    SearchDrafts,
+    OpenSettings,
+    ShowHelp,
+    Quit,
+}
+
+impl Command {
+    pub const ALL: [Self; 11] = [
+        Self::NewBrainDump,
+        Self::EditDraft,
+        Self::CopyDraft,
+        Self::ChangeTone,
+        Self::MarkComplete,
+        Self::SnoozeDraft,
+        Self::DeleteDraft,
+        Self::SearchDrafts,
+        Self::OpenSettings,
+        Self::ShowHelp,
+        Self::Quit,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NewBrainDump => "New brain dump",
+            Self::EditDraft => "Edit draft",
+            Self::CopyDraft => "Copy draft",
+            Self::ChangeTone => "Change tone",
+            Self::MarkComplete => "Mark complete",
+            Self::SnoozeDraft => "Snooze draft",
+            Self::DeleteDraft => "Delete draft",
+            Self::SearchDrafts => "Search drafts",
+            Self::OpenSettings => "Open Settings",
+            Self::ShowHelp => "Show help",
+            Self::Quit => "Quit",
+        }
+    }
 }
 
 impl Popup {
@@ -71,6 +119,7 @@ impl Popup {
             Self::DiscardEdit => "Discard changes?",
             Self::ConfirmDelete => "Delete this draft?",
             Self::ConfirmRedraft => "Replace your edits?",
+            Self::CommandPalette => "Command palette",
         }
     }
 
@@ -90,6 +139,7 @@ impl Popup {
                  d                 delete draft\n\
                  v                 open draft in $EDITOR\n\
                  /                 search drafts\n\
+                 Ctrl+P            command palette\n\
                  Esc               back\n\
                  ?                 this help\n\
                  q                 quit"
@@ -127,6 +177,7 @@ impl Popup {
                  Regenerating replaces the saved version.\n\n\
                  Enter or y to regenerate. Esc or n to keep your edits."
             }
+            Self::CommandPalette => "Type to filter commands.",
         }
     }
 }
@@ -219,6 +270,9 @@ pub struct UiState {
     pub settings_model_list: ListState,
     pub settings_current_model: Option<String>,
 
+    pub palette_query: String,
+    pub palette_selection: usize,
+
     pub generation: GenerationState,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -251,6 +305,8 @@ impl Default for UiState {
             settings_models_error: None,
             settings_model_list: ListState::default(),
             settings_current_model: None,
+            palette_query: String::new(),
+            palette_selection: 0,
             generation: GenerationState::Idle,
             error: None,
             notice: None,
@@ -795,6 +851,66 @@ impl UiState {
         self.settings_model_list.select(Some(next));
     }
 
+    pub fn open_palette(&mut self) {
+        self.palette_query.clear();
+        self.palette_selection = 0;
+        self.popup = Some(Popup::CommandPalette);
+    }
+
+    pub fn palette_commands(&self) -> Vec<Command> {
+        if self.palette_query.is_empty() {
+            return Command::ALL.to_vec();
+        }
+
+        let query = self.palette_query.to_lowercase();
+        Command::ALL
+            .iter()
+            .copied()
+            .filter(|command| command.label().to_lowercase().contains(&query))
+            .collect()
+    }
+
+    pub fn selected_command(&self) -> Option<Command> {
+        self.palette_commands().get(self.palette_selection).copied()
+    }
+
+    pub fn push_palette(&mut self, character: char) {
+        self.palette_query.push(character);
+        self.clamp_palette_selection();
+    }
+
+    pub fn pop_palette(&mut self) {
+        self.palette_query.pop();
+        self.clamp_palette_selection();
+    }
+
+    pub fn select_next_command(&mut self) {
+        let count = self.palette_commands().len();
+        if count > 0 {
+            self.palette_selection = (self.palette_selection + 1) % count;
+        }
+    }
+
+    pub fn stop_palette(&mut self) {
+        self.palette_query.clear();
+        self.palette_selection = 0;
+        self.popup = None;
+    }
+
+    pub fn select_previous_command(&mut self) {
+        let count = self.palette_commands().len();
+        if count > 0 {
+            self.palette_selection = (self.palette_selection + count - 1) % count;
+        }
+    }
+
+    fn clamp_palette_selection(&mut self) {
+        let count = self.palette_commands().len();
+        if self.palette_selection >= count {
+            self.palette_selection = count.saturating_sub(1);
+        }
+    }
+
     pub fn selected_model_name(&self) -> Option<String> {
         let index = self.settings_model_list.selected()?;
         self.settings_models.as_ref()?.get(index).cloned()
@@ -1212,6 +1328,49 @@ mod tests {
         state.complete_drafting(vec![card("Only")]);
 
         assert_eq!(state.selected_draft().unwrap().title, "Only");
+    }
+
+    #[test]
+    fn the_palette_filters_commands_and_clamps_the_selection() {
+        let mut state = UiState::default();
+        state.open_palette();
+        assert_eq!(state.palette_commands().len(), 11);
+
+        for _ in 0..5 {
+            state.select_next_command();
+        }
+        assert!(state.palette_selection > 0);
+
+        state.push_palette('q');
+        state.push_palette('u');
+        state.push_palette('i');
+        state.push_palette('t');
+        let commands = state.palette_commands();
+        assert_eq!(commands, vec![Command::Quit]);
+        assert_eq!(state.palette_selection, 0, "selection clamps on filter");
+
+        state.pop_palette();
+        assert_eq!(
+            state.palette_commands(),
+            vec![Command::Quit],
+            "qui still only matches Quit"
+        );
+    }
+
+    #[test]
+    fn the_palette_matches_commands_case_insensitively() {
+        let mut state = UiState::default();
+        state.open_palette();
+        state.push_palette('T');
+        state.push_palette('O');
+        state.push_palette('N');
+        state.push_palette('E');
+
+        assert_eq!(
+            state.palette_commands(),
+            vec![Command::ChangeTone],
+            "tone matches Change tone only"
+        );
     }
 
     #[test]
